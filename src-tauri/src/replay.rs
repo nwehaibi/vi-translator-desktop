@@ -52,8 +52,16 @@ pub fn cli(args: &[String]) -> Option<i32> {
         }
     };
     if let Some(video) = opt("--replay-video") {
+        let sets = match settings_given(args) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                return Some(2);
+            }
+        };
         let o = ReplayOptions {
-            fps: num("--fps", 30.0),
+            fps: opt("--fps").and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0),
+            sets,
             rate: num("--rate", 1.0),
             tail_s: num("--tail", 5.0),
             engine: opt("--engine"),
@@ -75,6 +83,15 @@ pub fn cli(args: &[String]) -> Option<i32> {
         let start = opt("--start").and_then(|v| v.parse::<u64>().ok());
         return Some(finish(evaluate_files(Path::new(&events), Path::new(&gold), &report, start, num("--rate", 1.0), num("--min-visible", 300.0) as u64)));
     }
+    if let Some(plan) = opt("--sweep") {
+        let out = opt("--out-dir").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("sweep"));
+        return Some(finish(sweep(Path::new(&plan), &out)));
+    }
+    if let Some(log) = opt("--summarize") {
+        let report = opt("--report").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("session-summary.json"));
+        let (from, to) = (opt("--from").and_then(|v| v.parse::<u64>().ok()), opt("--to").and_then(|v| v.parse::<u64>().ok()));
+        return Some(finish(summarize(Path::new(&log), from, to, &report)));
+    }
     if let Some(video) = opt("--gold-draft") {
         let Some(out) = opt("--out") else {
             eprintln!("usage: --gold-draft <video> --out draft.json [--fps 10]");
@@ -86,7 +103,10 @@ pub fn cli(args: &[String]) -> Option<i32> {
 }
 
 struct ReplayOptions {
-    fps: f64,
+    /// frames a second from the video (None: the capture rate in use, Capture FPS, as the capture would)
+    fps: Option<f64>,
+    /// the timing settings changed for this run (`--set key=value`)
+    sets: Vec<(String, u64)>,
     rate: f64,
     tail_s: f64,
     engine: Option<String>,
@@ -97,6 +117,62 @@ struct ReplayOptions {
     data: PathBuf,
     db: PathBuf,
     min_visible_ms: u64,
+}
+
+// ------------------------------------------------------------------------------------- settings
+
+/// The five timing settings (Source → Timing), with the ranges of their sliders (ui/app.js renderTiming).
+pub const TIMING_KEYS: [(&str, u64, u64); 5] =
+    [("capture_fps", 1, 60), ("preview_fps", 5, 60), ("interval_ms", 16, 1000), ("stable_ms", 0, 1500), ("clear_after_ms", 50, 3000)];
+
+/// The `--set key=value` given (each a timing setting, within its slider's range).
+fn settings_given(args: &[String]) -> anyhow::Result<Vec<(String, u64)>> {
+    let mut out = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        if a != "--set" {
+            continue;
+        }
+        let kv = args.get(i + 1).ok_or_else(|| anyhow::anyhow!("--set needs key=value"))?;
+        let (k, v) = kv.split_once('=').ok_or_else(|| anyhow::anyhow!("--set {kv}: key=value"))?;
+        let Some((_, lo, hi)) = TIMING_KEYS.iter().find(|(name, _, _)| *name == k) else {
+            anyhow::bail!("--set {k}: one of {}", TIMING_KEYS.map(|t| t.0).join(", "));
+        };
+        let n: u64 = v.trim().parse().map_err(|_| anyhow::anyhow!("--set {kv}: a whole number"))?;
+        if n < *lo || n > *hi {
+            anyhow::bail!("--set {kv}: from {lo} to {hi} (the slider's range)");
+        }
+        out.push((k.to_string(), n));
+    }
+    Ok(out)
+}
+
+/// Change the settings as moving their sliders does: the three reading timings become the player's own
+/// (timing_custom), starting from those in use (the game's, from its layout, where it has them).
+fn apply_settings(cfg: &mut Config, sets: &[(String, u64)]) {
+    if sets.iter().any(|(k, _)| matches!(k.as_str(), "interval_ms" | "stable_ms" | "clear_after_ms")) && cfg.timing_custom != Some(true) {
+        let (i, s, c) = cfg.timing();
+        (cfg.interval_ms, cfg.stable_ms, cfg.clear_after_ms) = (i, s, c);
+        cfg.timing_custom = Some(true);
+    }
+    for (k, v) in sets {
+        match k.as_str() {
+            "capture_fps" => cfg.capture_fps = *v as u32,
+            "preview_fps" => cfg.preview_fps = *v as u32,
+            "interval_ms" => cfg.interval_ms = *v,
+            "stable_ms" => cfg.stable_ms = *v,
+            "clear_after_ms" => cfg.clear_after_ms = *v,
+            _ => {}
+        }
+    }
+}
+
+/// The timing in use (what a report says the run had).
+fn settings_in_use(cfg: &Config) -> Value {
+    let (interval, stable, clear) = cfg.timing();
+    json!({
+        "capture_fps": cfg.capture_fps, "preview_fps": cfg.preview_fps, "interval_ms": interval, "stable_ms": stable,
+        "clear_after_ms": clear, "timing_custom": cfg.timing_custom == Some(true),
+    })
 }
 
 // ------------------------------------------------------------------------------------- video
@@ -205,16 +281,26 @@ fn replay(video: &str, o: &ReplayOptions) -> anyhow::Result<()> {
         std::thread::spawn(move || sync::run(s, c, m, p));
         std::thread::sleep(Duration::from_secs(3));
     }
-    eprintln!("replay: {video} ({w}x{h}, {} fps, ×{}), working copy in {}", o.fps, o.rate, work.display());
+    // the settings for this run, over what the layout set (as the player's sliders over the game's timing)
+    let (fps, settings) = {
+        let mut c = cfg.lock().unwrap();
+        apply_settings(&mut c, &o.sets);
+        if o.sets.iter().any(|(k, _)| k == "preview_fps") {
+            eprintln!("note: Preview FPS changes nothing here (no preview while replaying): measure it in the app");
+        }
+        (o.fps.unwrap_or(f64::from(c.capture_fps.clamp(1, 60))), settings_in_use(&c))
+    };
+    eprintln!("replay: {video} ({w}x{h}, {fps} fps, ×{}), settings {settings}, working copy in {}", o.rate, work.display());
+    let (cpu0, wall0) = (vi_translator_core::fork::cpu::now(), Instant::now());
 
     // frames at their own pace, the newest kept (as the capture does)
     let latest: Arc<Mutex<Option<Arc<FrameData>>>> = Arc::new(Mutex::new(None));
     let done = Arc::new(AtomicBool::new(false));
     let start_unix = Arc::new(AtomicU64::new(0));
-    let (mut child, mut pipe) = decode(video, o.fps)?;
+    let (mut child, mut pipe) = decode(video, fps)?;
     let decoder = {
         let (latest, done, start_unix) = (latest.clone(), done.clone(), start_unix.clone());
-        let (fps, rate) = (o.fps, o.rate);
+        let rate = o.rate;
         std::thread::spawn(move || {
             let mut n = 0u64;
             let mut t0 = None::<Instant>;
@@ -239,7 +325,7 @@ fn replay(video: &str, o: &ReplayOptions) -> anyhow::Result<()> {
             n
         })
     };
-    linelog::emit("replay", json!({ "video": video, "fps": o.fps, "rate": o.rate, "engine": engine_id, "app": vi_translator_core::VERSION }));
+    linelog::emit("replay", json!({ "video": video, "fps": fps, "rate": o.rate, "engine": engine_id, "app": vi_translator_core::VERSION, "settings": settings }));
 
     // the reading, as the app's (main.rs ocr_loop): the newest frame, the wait the reading asks for
     Ocr::init_thread();
@@ -278,6 +364,16 @@ fn replay(video: &str, o: &ReplayOptions) -> anyhow::Result<()> {
     }
     let frames = decoder.join().unwrap_or(0);
     let _ = child.wait();
+    // the CPU over the run: this app's (the reading, the translator, taking the frames) and everything's
+    // (ffmpeg's decoding too, standing in for the capture)
+    let wall_ms = wall0.elapsed().as_secs_f64() * 1000.0;
+    let cpu = match (cpu0, vi_translator_core::fork::cpu::now()) {
+        (Some(a), Some(b)) => {
+            let (app, all) = vi_translator_core::fork::cpu::share(&a, &b).unwrap_or((0.0, 0.0));
+            json!({ "app_pct": app, "all_pct": all, "app_core_pct": ((b.process_ms - a.process_ms) / wall_ms * 1000.0).round() / 10.0 })
+        }
+        _ => Value::Null,
+    };
     // (when the video's first frame was taken: the reference's times count from it)
     let start = start_unix.load(Ordering::Relaxed);
     linelog::emit("replay_end", json!({ "frames": frames, "start_unix_ms": start }));
@@ -290,7 +386,10 @@ fn replay(video: &str, o: &ReplayOptions) -> anyhow::Result<()> {
     let events_file = o.report.with_extension("events.jsonl");
     std::fs::write(&events_file, events.iter().map(|e| format!("{e}\n")).collect::<String>())?;
     eprintln!("replay: {frames} frames, {} events → {}", events.len(), events_file.display());
-    let mut report = json!({ "video": video, "fps": o.fps, "rate": o.rate, "engine": engine_id, "app": vi_translator_core::VERSION, "start_unix_ms": start, "reads": reads_summary(&events) });
+    let mut report = json!({
+        "video": video, "fps": fps, "rate": o.rate, "engine": engine_id, "app": vi_translator_core::VERSION, "start_unix_ms": start,
+        "settings": settings, "cpu": cpu, "reads": reads_summary(&events),
+    });
     if let Some(gold) = &o.gold {
         let gold = load_gold(gold)?;
         let ev = evaluate(&events, &gold, start, o.rate, o.min_visible_ms);
@@ -320,7 +419,27 @@ fn reads_summary(events: &[Value]) -> Value {
         suppressed += e["suppressed"].as_u64().unwrap_or(0);
     }
     let avg = |t: f64, n: f64| if n > 0.0 { (t / n * 10.0).round() / 10.0 } else { 0.0 };
-    json!({ "area_reads": n, "ocr_avg_ms": avg(ocr, n), "ocr_max_ms": ocr_max, "passes": passes, "pass_avg_ms": avg(pass, passes), "pass_max_ms": pass_max, "filtered_suppressed": suppressed })
+    // (each second's: this app's share of the machine, everything's, frames captured)
+    let per_second = |k: &str| {
+        let v: Vec<f64> = events.iter().filter(|e| e["ev"] == "reads").filter_map(|e| e[k].as_f64()).collect();
+        spread(&v)
+    };
+    json!({
+        "area_reads": n, "ocr_avg_ms": avg(ocr, n), "ocr_max_ms": ocr_max, "passes": passes, "pass_avg_ms": avg(pass, passes), "pass_max_ms": pass_max,
+        "filtered_suppressed": suppressed, "cpu_app_pct": per_second("cpu_app"), "cpu_all_pct": per_second("cpu_all"), "fps": per_second("fps"),
+    })
+}
+
+/// {p50, p90, max, avg, n} of some values (nulls when there are none).
+fn spread(v: &[f64]) -> Value {
+    if v.is_empty() {
+        return json!({ "p50": null, "p90": null, "max": null, "avg": null, "n": 0 });
+    }
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.total_cmp(b));
+    let pct = |p: f64| s[((s.len() as f64 - 1.0) * p).round() as usize];
+    let r = |x: f64| (x * 10.0).round() / 10.0;
+    json!({ "p50": r(pct(0.5)), "p90": r(pct(0.9)), "max": r(s[s.len() - 1]), "avg": r(s.iter().sum::<f64>() / s.len() as f64), "n": s.len() })
 }
 
 // ------------------------------------------------------------------------------------- evaluation
@@ -464,6 +583,8 @@ pub fn evaluate(events: &[Value], gold: &[GoldLine], start_unix: u64, rate: f64,
             *reasons.entry(r.clone()).or_default() += 1;
         }
         let latency = visible.map(|s| s.0.saturating_sub(at(g.start_ms)));
+        // how long its translation stayed after the English went (negative: taken down before, by the next line)
+        let linger = visible.filter(|s| s.1 != u64::MAX).map(|s| (s.0 + s.1) as i64 - at(g.end_ms) as i64);
         // how well it was read: the closest reading sent of it
         let cer = sent
             .iter()
@@ -484,6 +605,7 @@ pub fn evaluate(events: &[Value], gold: &[GoldLine], start_unix: u64, rate: f64,
             "on_time": visible.map(|s| s.0 <= at(g.end_ms)), "latency_ms": latency,
             "shown_ms": visible.map(|s| if s.1 == u64::MAX { Value::Null } else { json!(s.1) }), "reason": reason,
             "cer": cer.map(|c| (c * 1000.0).round() / 1000.0), "seqs": seqs,
+            "linger_ms": linger, "sends": sent.len(), "shows": shown.len(),
         }));
     }
     // shown lines out of order (an older line's translation after a newer one's), by area
@@ -527,6 +649,10 @@ pub fn evaluate(events: &[Value], gold: &[GoldLine], start_unix: u64, rate: f64,
             "S_late": rate(sel.iter().filter(|l| l["on_time"] == false).count() as f64),
             "latency_ms": { "p50": pct(0.5), "p90": pct(0.9), "n": lat.len() },
             "cer_avg": if cers.is_empty() { Value::Null } else { json!((cers.iter().sum::<f64>() / cers.len() as f64 * 1000.0).round() / 1000.0) },
+            // (after the English went; sent to the translator and shown, a line: more than once is a line
+            // sent half-read, or blinking off and on)
+            "linger_ms": spread(&sel.iter().filter_map(|l| l["linger_ms"].as_f64()).collect::<Vec<_>>()),
+            "sends_avg": avg_of(&sel, "sends"), "shows_avg": avg_of(&sel, "shows"),
         })
     };
     let mut by_area = serde_json::Map::new();
@@ -547,17 +673,326 @@ pub fn evaluate(events: &[Value], gold: &[GoldLine], start_unix: u64, rate: f64,
     })
 }
 
+/// The average of a count over lines that were detected (a lost line's zero would hide the extra ones).
+fn avg_of(lines: &[&Value], key: &str) -> Value {
+    let v: Vec<f64> = lines.iter().filter(|l| l["detected"] == true).filter_map(|l| l[key].as_f64()).collect();
+    if v.is_empty() { Value::Null } else { json!((v.iter().sum::<f64>() / v.len() as f64 * 100.0).round() / 100.0) }
+}
+
 fn print_summary(ev: &Value) {
     let s = &ev["summary"];
     eprintln!(
-        "reference lines: {} · detected {} · translated {} · shown {} (on time {}, late {}) · latency p50 {} ms p90 {} ms · order violations {} · wrong displays {} · CER {}",
-        s["lines"], s["D"], s["T"], s["S"], s["S_on_time"], s["S_late"], s["latency_ms"]["p50"], s["latency_ms"]["p90"], ev["order_violations"], ev["wrong_displays"], s["cer_avg"]
+        "reference lines: {} · detected {} · translated {} · shown {} (on time {}, late {}) · latency p50 {} ms p90 {} ms · stays after the English p50 {} ms · sent {}× shown {}× a line · order violations {} · wrong displays {} · CER {}",
+        s["lines"], s["D"], s["T"], s["S"], s["S_on_time"], s["S_late"], s["latency_ms"]["p50"], s["latency_ms"]["p90"], s["linger_ms"]["p50"], s["sends_avg"], s["shows_avg"],
+        ev["order_violations"], ev["wrong_displays"], s["cer_avg"]
     );
     if let Some(r) = ev["loss_reasons"].as_object() {
         for (k, v) in r {
             eprintln!("  lost: {k} × {v}");
         }
     }
+}
+
+// ------------------------------------------------------------------------------------- sweep
+
+/// `--sweep plan.json --out-dir <folder>`: the same video replayed with each run's settings, every run
+/// `repeat` times, in a shuffled order each round (a slow drift — the PC warming up — spread over every
+/// run, not on the last ones), with a pause between runs for the PC to cool down. Each run is a process
+/// of its own (nothing carried over), its report kept in the folder (a sweep stopped part-way goes on
+/// where it stopped when started again); then a table of them all: sweep.json and sweep.csv.
+///
+/// ```json
+/// { "video": "calibration.mp4", "gold": "calibration-gold.json", "data": "frozen/data", "db": "frozen/db",
+///   "repeat": 2, "cooldown_s": 30, "base": { "preview_fps": 30 },
+///   "runs": [ { "name": "current" }, { "name": "interval-100", "set": { "interval_ms": 100 } } ] }
+/// ```
+/// (paths from the plan's folder; `data`, `db` optional: the app's own folders, copied for each run)
+#[derive(Deserialize)]
+struct SweepPlan {
+    video: String,
+    gold: String,
+    #[serde(default)]
+    data: Option<String>,
+    #[serde(default)]
+    db: Option<String>,
+    #[serde(default)]
+    repeat: Option<u32>,
+    #[serde(default)]
+    cooldown_s: Option<u64>,
+    #[serde(default)]
+    tail_s: Option<f64>,
+    #[serde(default)]
+    base: BTreeMap<String, u64>,
+    runs: Vec<SweepRun>,
+}
+
+#[derive(Deserialize, Clone)]
+struct SweepRun {
+    name: String,
+    #[serde(default)]
+    set: BTreeMap<String, u64>,
+}
+
+/// A run's settings checked as `--set` checks them.
+fn check_settings(name: &str, set: &BTreeMap<String, u64>) -> anyhow::Result<()> {
+    for (k, v) in set {
+        let Some((_, lo, hi)) = TIMING_KEYS.iter().find(|(key, _, _)| key == k) else {
+            anyhow::bail!("run {name}: {k} is not one of {}", TIMING_KEYS.map(|t| t.0).join(", "));
+        };
+        if v < lo || v > hi {
+            anyhow::bail!("run {name}: {k} {v} is outside {lo}..{hi} (the slider's range)");
+        }
+    }
+    Ok(())
+}
+
+/// The order of the runs in round `round` (the same every time: a sweep can be repeated or resumed).
+fn shuffled(n: usize, round: u32) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..n).collect();
+    let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ (u64::from(round) + 1).wrapping_mul(0xD1B5_4A32_D192_ED03);
+    for i in (1..n).rev() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        order.swap(i, (x % (i as u64 + 1)) as usize);
+    }
+    order
+}
+
+fn sweep(plan_file: &Path, out: &Path) -> anyhow::Result<()> {
+    let plan: SweepPlan = serde_json::from_slice(&std::fs::read(plan_file)?).map_err(|e| anyhow::anyhow!("{}: {e}", plan_file.display()))?;
+    let here = plan_file.parent().map(Path::to_path_buf).unwrap_or_default();
+    let at = |p: &str| if Path::new(p).is_absolute() { PathBuf::from(p) } else { here.join(p) };
+    let (video, gold) = (at(&plan.video), at(&plan.gold));
+    anyhow::ensure!(video.is_file(), "no video {}", video.display());
+    anyhow::ensure!(gold.is_file(), "no reference {}", gold.display());
+    anyhow::ensure!(!plan.runs.is_empty(), "no runs");
+    check_settings("base", &plan.base)?;
+    let mut names = std::collections::HashSet::new();
+    for r in &plan.runs {
+        anyhow::ensure!(!r.name.is_empty() && r.name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)), "run name {:?}: letters, digits, - _ . only", r.name);
+        anyhow::ensure!(names.insert(r.name.clone()), "run name {} twice", r.name);
+        check_settings(&r.name, &r.set)?;
+    }
+    std::fs::create_dir_all(out)?;
+    let exe = std::env::current_exe()?;
+    let (repeat, cooldown) = (plan.repeat.unwrap_or(1).clamp(1, 20), Duration::from_secs(plan.cooldown_s.unwrap_or(30).min(600)));
+    let total = plan.runs.len() * repeat as usize;
+    let mut done = 0;
+    for round in 0..repeat {
+        for i in shuffled(plan.runs.len(), round) {
+            let run = &plan.runs[i];
+            done += 1;
+            let report = out.join(format!("{}.{}.json", run.name, round + 1));
+            if report.is_file() {
+                eprintln!("sweep {done}/{total}: {} (round {}) done before", run.name, round + 1);
+                continue;
+            }
+            // (the run's own settings over the base)
+            let mut set = plan.base.clone();
+            set.extend(run.set.clone());
+            eprintln!("sweep {done}/{total}: {} (round {}) {set:?}", run.name, round + 1);
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.arg("--replay-video").arg(&video).arg("--gold").arg(&gold).arg("--report").arg(&report);
+            if let Some(d) = &plan.data {
+                cmd.arg("--data").arg(at(d));
+            }
+            if let Some(d) = &plan.db {
+                cmd.arg("--db").arg(at(d));
+            }
+            if let Some(t) = plan.tail_s {
+                cmd.arg("--tail").arg(t.to_string());
+            }
+            for (k, v) in &set {
+                cmd.arg("--set").arg(format!("{k}={v}"));
+            }
+            let status = cmd.status()?;
+            if !status.success() {
+                eprintln!("sweep: {} (round {}) failed ({status}): left out", run.name, round + 1);
+                let _ = std::fs::remove_file(&report);
+            }
+            if done < total {
+                std::thread::sleep(cooldown);
+            }
+        }
+    }
+    // the table: every run, then each run's average over the rounds
+    let mut rows = Vec::new();
+    for round in 0..repeat {
+        for run in &plan.runs {
+            let report = out.join(format!("{}.{}.json", run.name, round + 1));
+            if let Some(r) = std::fs::read(&report).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
+                rows.push(sweep_row(&run.name, round + 1, &r));
+            }
+        }
+    }
+    let averages: Vec<Value> = plan.runs.iter().filter_map(|run| average_rows(&run.name, &rows.iter().filter(|r| r["name"] == run.name.as_str()).collect::<Vec<_>>())).collect();
+    std::fs::write(out.join("sweep.json"), serde_json::to_string_pretty(&json!({ "plan": plan_file.display().to_string(), "averages": averages, "runs": rows }))?)?;
+    std::fs::write(out.join("sweep.csv"), to_csv(&averages))?;
+    eprintln!("\n{:<22} {:>5} {:>5} {:>5} {:>4} {:>6} {:>7} {:>7} {:>7} {:>7} {:>7}", "run", "int", "stab", "clear", "fps", "S", "p50", "p90", "stays", "cpuApp", "cpuAll");
+    for a in &averages {
+        let n = |k: &str| a[k].as_f64().map(|v| format!("{v}")).unwrap_or_else(|| "-".into());
+        eprintln!(
+            "{:<22} {:>5} {:>5} {:>5} {:>4} {:>6} {:>7} {:>7} {:>7} {:>7} {:>7}",
+            a["name"].as_str().unwrap_or(""), n("interval_ms"), n("stable_ms"), n("clear_after_ms"), n("capture_fps"), n("S"), n("latency_p50"), n("latency_p90"), n("linger_p50"), n("cpu_app_pct"), n("cpu_all_pct")
+        );
+    }
+    eprintln!("sweep: {} runs → {}", rows.len(), out.join("sweep.csv").display());
+    Ok(())
+}
+
+/// One run of a sweep as a row of numbers (the settings it had, how it did, what it cost).
+fn sweep_row(name: &str, round: u32, r: &Value) -> Value {
+    let (st, ev, s) = (&r["settings"], &r["evaluation"], &r["evaluation"]["summary"]);
+    let mut row = json!({
+        "name": name, "round": round,
+        "capture_fps": st["capture_fps"], "interval_ms": st["interval_ms"], "stable_ms": st["stable_ms"], "clear_after_ms": st["clear_after_ms"],
+        "D": s["D"], "T": s["T"], "S": s["S"], "S_on_time": s["S_on_time"], "S_late": s["S_late"],
+        "latency_p50": s["latency_ms"]["p50"], "latency_p90": s["latency_ms"]["p90"],
+        "linger_p50": s["linger_ms"]["p50"], "linger_p90": s["linger_ms"]["p90"], "sends_avg": s["sends_avg"], "shows_avg": s["shows_avg"],
+        "short_S": ev["short_lines"]["S"], "cer_avg": s["cer_avg"], "order_violations": ev["order_violations"], "wrong_displays": ev["wrong_displays"],
+        "cpu_app_pct": r["cpu"]["app_pct"], "cpu_all_pct": r["cpu"]["all_pct"], "cpu_app_core_pct": r["cpu"]["app_core_pct"],
+        "ocr_avg_ms": r["reads"]["ocr_avg_ms"], "pass_avg_ms": r["reads"]["pass_avg_ms"], "fps_p50": r["reads"]["fps"]["p50"],
+    });
+    // each area's shown share (the dialogue's subtitles first of all)
+    if let (Some(by_area), Some(obj)) = (ev["by_area"].as_object(), row.as_object_mut()) {
+        for (area, t) in by_area {
+            obj.insert(format!("S_{area}"), t["S"].clone());
+            obj.insert(format!("latency_p50_{area}"), t["latency_ms"]["p50"].clone());
+        }
+    }
+    row
+}
+
+/// A run's rounds averaged (numbers only; the lowest and highest latency and CPU kept too).
+fn average_rows(name: &str, rows: &[&Value]) -> Option<Value> {
+    let first = rows.first()?;
+    let mut out = serde_json::Map::new();
+    out.insert("name".into(), json!(name));
+    out.insert("rounds".into(), json!(rows.len()));
+    for (k, _) in first.as_object()?.iter().filter(|(k, _)| *k != "name" && *k != "round") {
+        let v: Vec<f64> = rows.iter().filter_map(|r| r[k].as_f64()).collect();
+        let avg = if v.is_empty() { Value::Null } else { json!((v.iter().sum::<f64>() / v.len() as f64 * 1000.0).round() / 1000.0) };
+        out.insert(k.clone(), avg);
+        if matches!(k.as_str(), "latency_p50" | "latency_p90" | "cpu_app_pct" | "cpu_all_pct") && !v.is_empty() {
+            let (lo, hi) = v.iter().fold((f64::MAX, f64::MIN), |(lo, hi), x| (lo.min(*x), hi.max(*x)));
+            out.insert(format!("{k}_min"), json!(lo));
+            out.insert(format!("{k}_max"), json!(hi));
+        }
+    }
+    Some(Value::Object(out))
+}
+
+/// Rows as CSV: the run and its settings first, then how it did and what it cost, then the rest.
+fn to_csv(rows: &[Value]) -> String {
+    const FIRST: [&str; 18] = [
+        "name", "rounds", "interval_ms", "stable_ms", "clear_after_ms", "capture_fps", "S", "S_on_time", "S_late", "D", "T",
+        "latency_p50", "latency_p90", "linger_p50", "linger_p90", "cpu_app_pct", "cpu_all_pct", "cpu_app_core_pct",
+    ];
+    let Some(keys) = rows.first().and_then(|r| r.as_object()).map(|o| o.keys().cloned().collect::<Vec<_>>()) else { return String::new() };
+    let mut cols: Vec<String> = FIRST.iter().filter(|k| keys.iter().any(|x| x == *k)).map(|k| k.to_string()).collect();
+    cols.extend(keys.into_iter().filter(|k| !FIRST.contains(&k.as_str())));
+    let cell = |v: &Value| match v {
+        Value::Null => String::new(),
+        Value::String(s) => format!("\"{}\"", s.replace('"', "\"\"")),
+        other => other.to_string(),
+    };
+    let mut out = cols.join(",") + "\n";
+    for r in rows {
+        out += &cols.iter().map(|c| cell(&r[c.as_str()])).collect::<Vec<_>>().join(",");
+        out += "\n";
+    }
+    out
+}
+
+// ------------------------------------------------------------------------------------- a session's log
+
+/// `--summarize lines.log [--from <Unix ms>] [--to <Unix ms>] [--report out.json]`: what the
+/// measurement log says about a session played with the app (no reference needed): how fast lines went
+/// up after their English appeared, what the CPU did (this app and the whole PC, the Xbox player's
+/// video included), each second's reading times and frames, the TV's drawing, what was left out and
+/// why — over the whole session and minute by minute (a PC slowing down as it warms up shows there).
+fn summarize(log: &Path, from: Option<u64>, to: Option<u64>, report: &Path) -> anyhow::Result<()> {
+    // the older copy first (lines.log.1), then the log
+    let mut events: Vec<Value> = Vec::new();
+    for f in [linelog::rotated(log), log.to_path_buf()] {
+        if let Ok(text) = std::fs::read_to_string(&f) {
+            events.extend(text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()));
+        }
+    }
+    let t = |e: &Value| e["t"].as_u64().unwrap_or(0);
+    events.retain(|e| from.is_none_or(|f| t(e) >= f) && to.is_none_or(|x| t(e) <= x));
+    events.sort_by_key(|e| t(e));
+    anyhow::ensure!(!events.is_empty(), "no events in {} (is the measurement log on?)", log.display());
+    let summary = session_summary(&events);
+    eprintln!(
+        "session: {} min · lines shown {} (late {}) · English → Arabic p50 {} ms p90 {} ms · CPU this app p50 {} % · the whole PC p50 {} % p90 {} % · frames {} /s · reading pass p50 {} ms",
+        summary["minutes"], summary["counts"]["shown"], summary["counts"]["late"], summary["latency_ms"]["p50"], summary["latency_ms"]["p90"],
+        summary["cpu_app_pct"]["p50"], summary["cpu_all_pct"]["p50"], summary["cpu_all_pct"]["p90"], summary["fps"]["p50"], summary["pass_avg_ms"]["p50"]
+    );
+    std::fs::write(report, serde_json::to_string_pretty(&summary)?)?;
+    eprintln!("session summary → {}", report.display());
+    Ok(())
+}
+
+pub fn session_summary(events: &[Value]) -> Value {
+    let t = |e: &Value| e["t"].as_u64().unwrap_or(0);
+    let of = |kind: &'static str| events.iter().filter(move |e| e["ev"] == kind);
+    let nums = |kind: &'static str, f: &dyn Fn(&Value) -> Option<f64>| of(kind).filter_map(f).collect::<Vec<f64>>();
+    let (t0, t1) = (events.first().map(t).unwrap_or(0), events.last().map(t).unwrap_or(0));
+    let count = |kind: &'static str| of(kind).count();
+    let mut reasons: BTreeMap<String, u64> = BTreeMap::new();
+    for e in of("filtered") {
+        *reasons.entry(e["reason"].as_str().unwrap_or("?").to_string()).or_default() += 1;
+    }
+    let latency = |e: &Value| Some(t(e).checked_sub(e["at"].as_u64()?)? as f64);
+    // minute by minute: the CPU, the reading, the lines and how fast they went up
+    let mut minutes: BTreeMap<u64, (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    for e in events {
+        let m = (t(e).saturating_sub(t0)) / 60_000;
+        let slot = minutes.entry(m).or_default();
+        if e["ev"] == "reads" {
+            slot.0.extend(e["cpu_app"].as_f64());
+            slot.1.extend(e["cpu_all"].as_f64());
+            slot.2.extend(e["pass_avg"].as_f64());
+        } else if e["ev"] == "shown" {
+            slot.3.extend(latency(e));
+        }
+    }
+    let avg = |v: &[f64]| if v.is_empty() { Value::Null } else { json!((v.iter().sum::<f64>() / v.len() as f64 * 10.0).round() / 10.0) };
+    let timeline: Vec<Value> = minutes
+        .iter()
+        .map(|(m, (app, all, pass, lat))| json!({ "minute": m, "cpu_app_pct": avg(app), "cpu_all_pct": avg(all), "pass_avg_ms": avg(pass), "shown": lat.len(), "latency_ms_avg": avg(lat) }))
+        .collect();
+    json!({
+        "from_unix_ms": t0, "to_unix_ms": t1, "minutes": ((t1 - t0) as f64 / 60_000.0 * 10.0).round() / 10.0,
+        "counts": {
+            "seen": count("seen"), "sent": count("sent"), "translated": count("translated"),
+            "from_memory": of("translated").filter(|e| e["hit"] == true).count(), "shown": count("shown"),
+            "late": of("shown").filter(|e| e["late"] == true).count(), "skipped": count("skipped"),
+            "replaced": count("replaced"), "dropped": count("dropped"), "hidden": count("hidden"),
+        },
+        // (from the English appearing — as first read — to its Arabic up)
+        "latency_ms": spread(&nums("shown", &latency)),
+        // (from the frame's capture to its first reading: the frame's age and the reading)
+        "first_read_ms": spread(&nums("seen", &|e| Some(t(e).checked_sub(e["captured"].as_u64()?)? as f64))),
+        "translate_ms": {
+            "memory": spread(&nums("translated", &|e| (e["hit"] == true).then(|| e["ms"].as_f64()).flatten())),
+            "translator": spread(&nums("translated", &|e| (e["hit"] == false && e["ok"] == true).then(|| e["ms"].as_f64()).flatten())),
+        },
+        "shown_ms": spread(&nums("hidden", &|e| e["shown_ms"].as_f64())),
+        "cpu_app_pct": spread(&nums("reads", &|e| e["cpu_app"].as_f64())),
+        "cpu_all_pct": spread(&nums("reads", &|e| e["cpu_all"].as_f64())),
+        "fps": spread(&nums("reads", &|e| e["fps"].as_f64())),
+        "pass_avg_ms": spread(&nums("reads", &|e| e["pass_avg"].as_f64())),
+        "ocr_avg_ms": spread(&nums("reads", &|e| e["ocr_avg"].as_f64())),
+        "tv": {
+            "sent_to_drawn_ms": spread(&nums("tv_drawn", &|e| Some(e["est"].as_f64()? - e["sent"].as_f64()?))),
+            "draw_ms": spread(&nums("tv_drawn", &|e| e["draw_ms"].as_f64())),
+        },
+        "filtered": reasons,
+        "timeline": timeline,
+    })
 }
 
 // ------------------------------------------------------------------------------------- reference draft
@@ -667,6 +1102,76 @@ mod tests {
     }
 
     #[test]
+    fn fork_settings_are_set_as_their_sliders_set_them() {
+        let args: Vec<String> = ["x", "--set", "interval_ms=100", "--set", "capture_fps=12"].iter().map(|s| s.to_string()).collect();
+        let sets = settings_given(&args).unwrap();
+        assert_eq!(sets, vec![("interval_ms".to_string(), 100), ("capture_fps".to_string(), 12)]);
+        // (outside a slider's range, or not a setting: refused)
+        for bad in ["interval_ms=5", "clear_after_ms=4000", "speed=3", "stable_ms=abc", "stable_ms"] {
+            let a: Vec<String> = ["x", "--set", bad].iter().map(|s| s.to_string()).collect();
+            assert!(settings_given(&a).is_err(), "{bad}");
+        }
+        // the game's timing in use (its layout's): moving one slider keeps the other two as they were in use
+        let mut c = Config::default();
+        c.timing_custom = Some(false);
+        let gta = c.builtins.iter_mut().find(|p| p.id == c.profile).expect("the profile in use");
+        gta.timing = config::Timing { interval_ms: 40, stable_ms: 200, clear_after_ms: 500 };
+        apply_settings(&mut c, &sets);
+        assert_eq!(c.timing(), (100, 200, 500));
+        assert_eq!((c.timing_custom, c.capture_fps), (Some(true), 12));
+        assert_eq!(settings_in_use(&c)["interval_ms"], 100);
+    }
+
+    #[test]
+    fn fork_a_sweep_shuffles_each_round_the_same_way_every_time() {
+        for round in 0..4 {
+            let a = shuffled(7, round);
+            assert_eq!(a, shuffled(7, round), "the same order every time");
+            let mut sorted = a.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, (0..7).collect::<Vec<_>>(), "every run once");
+        }
+        assert_ne!(shuffled(7, 0), shuffled(7, 1), "another order each round");
+        // the rounds averaged, the spread of latency and CPU kept
+        let rows = [json!({ "name": "a", "round": 1, "S": 0.9, "latency_p50": 150.0, "cpu_app_pct": 20.0 }), json!({ "name": "a", "round": 2, "S": 0.8, "latency_p50": 170.0, "cpu_app_pct": 30.0 })];
+        let avg = average_rows("a", &rows.iter().collect::<Vec<_>>()).unwrap();
+        assert_eq!((avg["S"].as_f64(), avg["latency_p50"].as_f64(), avg["latency_p50_min"].as_f64(), avg["cpu_app_pct_max"].as_f64()), (Some(0.85), Some(160.0), Some(150.0), Some(30.0)));
+        assert_eq!(to_csv(&[avg]).lines().count(), 2);
+    }
+
+    #[test]
+    fn fork_the_example_sweep_plan_is_one_the_sweep_takes() {
+        let plan: SweepPlan = serde_json::from_str(include_str!("../../.fork/sweep-plan.example.json")).expect("the plan reads");
+        check_settings("base", &plan.base).unwrap();
+        for r in &plan.runs {
+            check_settings(&r.name, &r.set).unwrap();
+        }
+        assert!(plan.runs.iter().any(|r| r.set.is_empty()), "the settings in use, to compare with");
+    }
+
+    #[test]
+    fn fork_a_sessions_log_is_summed_up() {
+        let s = 2_000_000u64;
+        let events = vec![
+            ev("reads", json!({ "cpu_app": 20.0, "cpu_all": 60.0, "fps": 12.0, "pass_avg": 90.0, "ocr_avg": 30.0, "t": s })),
+            ev("seen", json!({ "area": "subtitles", "captured": s + 900, "t": s + 1000 })),
+            ev("translated", json!({ "area": "subtitles", "seq": 1, "ok": true, "hit": true, "ms": 0.4, "t": s + 1010 })),
+            ev("shown", json!({ "area": "subtitles", "seq": 1, "at": s + 1000, "late": false, "t": s + 1150 })),
+            ev("filtered", json!({ "area": "subtitles", "reason": "clean", "t": s + 2000 })),
+            ev("reads", json!({ "cpu_app": 40.0, "cpu_all": 80.0, "fps": 12.0, "pass_avg": 110.0, "ocr_avg": 35.0, "t": s + 61_000 })),
+            ev("tv_drawn", json!({ "sent": (s + 1200) as f64, "est": (s + 1260) as f64, "draw_ms": 30.0, "t": s + 1300 })),
+        ];
+        let r = session_summary(&events);
+        assert_eq!(r["counts"]["shown"], 1);
+        assert_eq!(r["latency_ms"]["p50"], 150.0);
+        assert_eq!(r["first_read_ms"]["p50"], 100.0);
+        assert_eq!(r["cpu_all_pct"]["max"], 80.0);
+        assert_eq!(r["tv"]["sent_to_drawn_ms"]["p50"], 60.0);
+        assert_eq!(r["filtered"]["clean"], 1);
+        assert_eq!(r["timeline"].as_array().map(Vec::len), Some(2), "minute by minute");
+    }
+
+    #[test]
     fn fork_a_line_is_found_in_a_block_and_in_a_misreading() {
         assert_eq!(found_in("Tourist: Eyes on the road! Lucia: No.", "No."), 1.0);
         assert!(found_in("Meet me at the dacks.", "Meet me at the docks.") >= ALIKE);
@@ -712,5 +1217,9 @@ mod tests {
         assert_eq!(r["order_violations"], 1);
         assert_eq!(r["wrong_displays"], 1);
         assert_eq!(r["short_lines"]["lines"], 1.0);
+        // its Arabic stayed 50 ms after the English went (up at 1250 for 1800 ms; the English gone at 3000)
+        assert_eq!(r["lines"][0]["linger_ms"], 50);
+        assert_eq!((r["lines"][0]["sends"].as_u64(), r["lines"][0]["shows"].as_u64()), (Some(1), Some(1)));
+        assert_eq!(r["summary"]["sends_avg"], 1.0);
     }
 }

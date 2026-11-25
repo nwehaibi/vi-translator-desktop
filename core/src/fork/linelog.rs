@@ -29,7 +29,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -181,6 +181,7 @@ pub fn note_frame(seq: u64, captured_ms: u64) {
     if !on() {
         return;
     }
+    FRAMES_NOW.fetch_add(1, Ordering::Relaxed);
     let mut f = FRAMES.lock().unwrap();
     if f.len() >= 512 {
         f.pop_front();
@@ -195,9 +196,14 @@ pub fn captured_of(seq: u64) -> Option<u64> {
 
 // ------------------------------------------------------------------------------------- readings
 
+/// Frames captured since the last per-second readings (their `fps`).
+static FRAMES_NOW: AtomicU32 = AtomicU32::new(0);
+
 #[derive(Default)]
 struct Reads {
     since: Option<Instant>,
+    /// the CPU times when this second's readings began
+    cpu: Option<super::cpu::Times>,
     n: u32,
     total: f64,
     max: f64,
@@ -215,11 +221,20 @@ fn with_reads(f: impl FnOnce(&mut Reads)) {
         let mut guard = READS.lock().unwrap();
         let r = guard.get_or_insert_with(Reads::default);
         let now = Instant::now();
-        let since = *r.since.get_or_insert(now);
+        let since = *r.since.get_or_insert_with(|| {
+            r.cpu = super::cpu::now();
+            FRAMES_NOW.store(0, Ordering::Relaxed);
+            now
+        });
         f(r);
-        if now.duration_since(since) < Duration::from_secs(1) {
+        let span = now.duration_since(since);
+        if span < Duration::from_secs(1) {
             return;
         }
+        // (this app's share of the whole machine, and everything's, over this second; frames captured a second)
+        let cpu_now = super::cpu::now();
+        let shares = r.cpu.as_ref().zip(cpu_now.as_ref()).and_then(|(a, b)| super::cpu::share(a, b));
+        let fps = round1(f64::from(FRAMES_NOW.swap(0, Ordering::Relaxed)) / span.as_secs_f64());
         let areas: serde_json::Map<String, Value> = r
             .areas
             .iter()
@@ -229,8 +244,9 @@ fn with_reads(f: impl FnOnce(&mut Reads)) {
             "n": r.n, "ocr_avg": round1(r.total / f64::from(r.n.max(1))), "ocr_max": round1(r.max),
             "pass_n": r.passes, "pass_avg": round1(r.pass_total / f64::from(r.passes.max(1))), "pass_max": round1(r.pass_max),
             "areas": areas, "suppressed": r.suppressed,
+            "cpu_app": shares.map(|s| s.0), "cpu_all": shares.map(|s| s.1), "fps": fps,
         });
-        *r = Reads { since: Some(now), ..Reads::default() };
+        *r = Reads { since: Some(now), cpu: cpu_now, ..Reads::default() };
         ev
     };
     emit("reads", event);

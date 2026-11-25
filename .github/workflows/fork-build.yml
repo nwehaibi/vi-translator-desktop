@@ -1,6 +1,12 @@
-# fork: the Xbox copy's own build (see FORK.md), run by hand: Actions → "Fork build (Windows x64)" →
-# Run workflow. Windows x64 only; the guard and the tests first (as the original's release runs them),
-# then the app. Two build artifacts:
+# fork: the Xbox copy's own build (see FORK.md). Windows x64 only; the guard and the tests first (as the
+# original's release runs them), then the app. Run:
+# - on every push to a working branch (claude/…), before anything is merged into main: a push runs the
+#   workflow as it is on the branch pushed (GitHub: "This includes workflows that are not merged into the
+#   default branch"); documentation-only pushes don't;
+# - by hand: Actions → "Fork build (Windows x64)" → Run workflow — that button is there once this file is
+#   on the default branch; before that, a run that has happened once can be started again on its branch
+#   with GitHub's API or CLI (gh workflow run fork-build.yml --ref <branch>).
+# Two build artifacts:
 # - vi-translator-xbox-windows-x64: the executable, unsigned (for your own use: no release, no update
 #   signature; this copy's updates are installed by hand) and its SHA-256;
 # - vi-translator-xbox-measurement-tools: the memory-equivalence tool built from the original's core and
@@ -16,6 +22,9 @@ on:
         description: "Run the tests first"
         type: boolean
         default: true
+  push:
+    branches: ["claude/**"]
+    paths-ignore: ["**.md", "NOTICE", "LICENSE"]
 
 permissions:
   contents: read
@@ -51,8 +60,9 @@ jobs:
           rustup target add "$TARGET"
 
       # (the app and its core: the workspace's default members, as the original's release tests them)
+      # (a push always tests; by hand, as chosen)
       - name: Test
-        if: inputs.tests
+        if: github.event_name != 'workflow_dispatch' || inputs.tests
         run: cargo test --target "$TARGET"
 
       - name: Build
@@ -80,18 +90,21 @@ jobs:
           cp core/examples/fork_memory_equivalence.rs ../vit-base/core/examples/
           (cd ../vit-base && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --release --target "$TARGET" -p vi-translator-core --example fork_memory_equivalence)
           cp "target/$TARGET/release/examples/fork_memory_equivalence.exe" out/tools/fork_memory_equivalence-original.exe
-          cp .fork/memory-check.cmd out/tools/
+          cp .fork/memory-check.cmd .fork/sweep-plan.example.json out/tools/
           printf 'original: %s\nfork: %s\n' "$base" "$(git rev-parse HEAD)" > out/tools/VERSIONS.txt
           ls -l out/tools
 
+      # (a push's builds are kept two weeks, a build asked for by hand a month: the storage is limited)
       - uses: actions/upload-artifact@v4
         with:
           name: vi-translator-xbox-windows-x64
           path: out/app/*
           if-no-files-found: error
+          retention-days: ${{ github.event_name == 'push' && 14 || 30 }}
 
       - uses: actions/upload-artifact@v4
         with:
           name: vi-translator-xbox-measurement-tools
           path: out/tools/*
           if-no-files-found: error
+          retention-days: ${{ github.event_name == 'push' && 14 || 30 }}

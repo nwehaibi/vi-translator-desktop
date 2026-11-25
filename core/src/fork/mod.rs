@@ -8,8 +8,11 @@
 //! - `settings`: the fork's switches (`fork-settings.json` in the app's data folder);
 //! - `linelog`: the per-line measurement log (Phase 0.1): what happened to each line read, and why a
 //!   line was lost when it was;
-//! - `tv_timing`: when a TV was sent a line and when it drew it (Phase 0.4).
+//! - `tv_timing`: when a TV was sent a line and when it drew it (Phase 0.4);
+//! - `cpu`: how much of the CPU this app and the whole system use (the log's per-second readings, for
+//!   the timing settings' calibration, Phase 0.6).
 
+pub mod cpu;
 pub mod linelog;
 pub mod settings;
 pub mod tv_timing;

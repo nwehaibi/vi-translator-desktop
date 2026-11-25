@@ -42,6 +42,7 @@ jobs:
       status: ${{ steps.merge.outputs.status }}
       upstream: ${{ steps.merge.outputs.upstream }}
       files: ${{ steps.merge.outputs.files }}
+      settings: ${{ steps.merge.outputs.settings }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -72,6 +73,11 @@ jobs:
             echo "status=conflict" >> "$GITHUB_OUTPUT"
             echo "files=${files}" >> "$GITHUB_OUTPUT"
             exit 0
+          fi
+          # (the original changing its timing defaults or moving saved settings to new ones — as v1.4.0 did
+          # for everyone's timing — can undo the calibrated timing: said in the pull request)
+          if git diff "$before" HEAD -- core/src/config.rs | grep -qE '^[+-].*(DEFAULTS_VERSION|DEFAULT_TIMING|defaults_version|capture_fps|preview_fps|interval_ms|stable_ms|clear_after_ms|timing_custom)'; then
+            echo "settings=yes" >> "$GITHUB_OUTPUT"
           fi
           printf '%s\n' "$up" > .fork/base-commit
           git add .fork/base-commit
@@ -127,6 +133,7 @@ jobs:
           TEST_RESULT: ${{ needs.test.result }}
           UP: ${{ needs.merge.outputs.upstream }}
           FILES: ${{ needs.merge.outputs.files }}
+          SETTINGS: ${{ needs.merge.outputs.settings }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -154,6 +161,9 @@ jobs:
             issue "تحديثات التطبيق الأصلي (${short}): فشلت الاختبارات" "دُمجت تحديثات التطبيق الأصلي حتى ${short} في الفرع ${SYNC_BRANCH}، لكن الاختبارات على Windows لم تنجح (${TEST_RESULT}). لا تدمجه قبل الإصلاح. التفاصيل: $RUN"
           else
             body="تحديثات التطبيق الأصلي حتى ${short}، مدموجة في ${SYNC_BRANCH}: الحارس نجح (ملفات الذاكرة والمفتاح والمعرّف كما في الأصل)، واختبارات Windows نجحت. راجع التغييرات ثم ادمج يدويًا. التفاصيل: $RUN"
+            if [ "$SETTINGS" = "yes" ]; then
+              body="${body} — تنبيه: يغيّر الأصل في core/src/config.rs قيم التوقيت الافتراضية أو ترحيل الإعدادات المحفوظة؛ بعد الدمج وأول تشغيل تحقّق أن قيم المعايرة (Capture FPS وPreview FPS والفاصل والاستقرار والإخفاء) ما زالت كما اعتمدتها."
+            fi
             existing="$(gh pr list --repo "$REPO" --head "$SYNC_BRANCH" --state open --json number --jq '.[0].number // empty' || true)"
             if [ -n "$existing" ]; then
               gh pr comment "$existing" --repo "$REPO" --body "$body"
