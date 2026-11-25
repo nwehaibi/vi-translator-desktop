@@ -273,6 +273,8 @@ struct Reads {
     pass_total: f64,
     pass_max: f64,
     areas: HashMap<String, (u32, f64)>,
+    /// each part of the passes (pages, phone, chat, areas, and what comes before them): total ms
+    stages: HashMap<&'static str, f64>,
     suppressed: u32,
 }
 
@@ -309,6 +311,8 @@ fn with_reads(f: impl FnOnce(&mut Reads)) {
             "n": r.n, "ocr_avg": round1(r.total / f64::from(r.n.max(1))), "ocr_max": round1(r.max),
             "pass_n": r.passes, "pass_avg": round1(r.pass_total / f64::from(r.passes.max(1))), "pass_max": round1(r.pass_max),
             "areas": areas, "suppressed": r.suppressed,
+            // (each part's time a pass, ms: where a pass's time goes)
+            "stages": r.stages.iter().map(|(k, v)| ((*k).to_string(), json!(round1(v / f64::from(r.passes.max(1)))))).collect::<serde_json::Map<String, Value>>(),
             "cpu_app": shares.map(|s| s.0), "cpu_all": shares.map(|s| s.1), "fps": fps, "preview_fps": preview_fps,
             "frame_w": (fw > 0).then_some(fw), "frame_h": (fh > 0).then_some(fh),
         });
@@ -337,12 +341,43 @@ pub fn read_sample(area: &str, ms: f64) {
     });
 }
 
+thread_local! {
+    /// the reading pass's part going on now, and since when
+    static STAGE: std::cell::RefCell<Option<(&'static str, Instant)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A reading pass starts (its first part: what comes before the pages).
+pub fn pass_start() {
+    if on() {
+        STAGE.with(|s| *s.borrow_mut() = Some(("setup", Instant::now())));
+    }
+}
+
+/// The pass goes on to its part `name` (the part before it ends now).
+pub fn stage(name: &'static str) {
+    if !on() {
+        return;
+    }
+    let now = Instant::now();
+    if let Some((prev, since)) = STAGE.with(|s| s.borrow_mut().replace((name, now))) {
+        let ms = (now - since).as_secs_f64() * 1000.0;
+        if let Some(r) = READS.lock().unwrap().as_mut() {
+            *r.stages.entry(prev).or_default() += ms;
+        }
+    }
+}
+
 /// A pass of the reading (every area, the pages, the phone) took `ms`.
 pub fn pass_sample(ms: f64) {
     if !on() {
         return;
     }
+    // (its last part ends now)
+    let last = STAGE.with(|s| s.borrow_mut().take()).map(|(name, since)| (name, since.elapsed().as_secs_f64() * 1000.0));
     with_reads(|r| {
+        if let Some((name, ms)) = last {
+            *r.stages.entry(name).or_default() += ms;
+        }
         r.passes += 1;
         r.pass_total += ms;
         r.pass_max = r.pass_max.max(ms);
@@ -480,6 +515,29 @@ mod tests {
         assert_eq!((r["frame_w"].as_u64(), r["frame_h"].as_u64()), (Some(2560), Some(1600)));
         assert!(r["preview_fps"].as_f64().is_some_and(|p| p > 0.0 && p <= 5.0), "{r}");
         assert!(r["fps"].as_f64().is_some_and(|p| p > 0.0), "{r}");
+    }
+
+    #[test]
+    fn fork_linelog_tells_where_a_pass_spends_its_time() {
+        let (_, v) = collect(|| {
+            // (the second's readings start with the first reading)
+            read_sample("subtitles", 1.0);
+            for _ in 0..2 {
+                pass_start();
+                stage("pages");
+                std::thread::sleep(Duration::from_millis(40));
+                stage("areas");
+                std::thread::sleep(Duration::from_millis(15));
+                pass_sample(55.0);
+            }
+            std::thread::sleep(Duration::from_millis(1000));
+            pass_start();
+            pass_sample(0.0);
+        });
+        let r = v.iter().find(|e| e["ev"] == "reads").expect("a second's readings");
+        let (pages, areas) = (r["stages"]["pages"].as_f64().unwrap_or(0.0), r["stages"]["areas"].as_f64().unwrap_or(0.0));
+        // (a pass's average: two of 40 and 15 ms, and one of nothing)
+        assert!(pages >= 25.0 && areas >= 9.0 && pages > areas, "{r}");
     }
 
     #[test]

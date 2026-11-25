@@ -988,6 +988,15 @@ pub fn session_summary(events: &[Value]) -> Value {
             v
         })
         .collect();
+    let stages: serde_json::Map<String, Value> = {
+        let mut parts: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        for e in of("reads") {
+            for (k, v) in e["stages"].as_object().into_iter().flatten() {
+                parts.entry(k.clone()).or_default().extend(v.as_f64());
+            }
+        }
+        parts.iter().map(|(k, v)| (k.clone(), spread(v))).collect()
+    };
     // the sizes read for text (the game window's)
     let mut sizes: BTreeMap<String, u64> = BTreeMap::new();
     for e in of("reads") {
@@ -1021,6 +1030,8 @@ pub fn session_summary(events: &[Value]) -> Value {
         "frame_sizes_seconds": sizes,
         "settings": settings,
         "pass_avg_ms": spread(&nums("reads", &|e| e["pass_avg"].as_f64())),
+        // (where a pass's time goes: each part's ms a pass, over the seconds that have it)
+        "stages_ms": stages,
         "ocr_avg_ms": spread(&nums("reads", &|e| e["ocr_avg"].as_f64())),
         "tv": {
             "sent_to_drawn_ms": spread(&nums("tv_drawn", &|e| Some(e["est"].as_f64()? - e["sent"].as_f64()?))),

@@ -64,7 +64,7 @@
 | الملف | الخطافات |
 |---|---|
 | `core/src/lib.rs` | `pub mod fork;` |
-| `core/src/engine.rs` | أحداث السجل في مسار السطر، وكلها لا تعمل إلا والسجل مفعّل:<br>• الظهور الأول `seen`، والإرسال `sent`، والترجمة `translated`، والتخطي `skipped`.<br>• الاستبدال قبل العرض `replaced`، والإسقاط `dropped`، والعرض `shown`، والإخفاء `hidden`.<br>• المسح `cleared`، والصفحات `page`، وأسباب الترشيح `filtered`، وأزمنة القراءة `reads`.<br>• الإعدادات الفعلية `settings` عند تغيّرها. |
+| `core/src/engine.rs` | أحداث السجل في مسار السطر، وكلها لا تعمل إلا والسجل مفعّل:<br>• الظهور الأول `seen`، والإرسال `sent`، والترجمة `translated`، والتخطي `skipped`.<br>• الاستبدال قبل العرض `replaced`، والإسقاط `dropped`، والعرض `shown`، والإخفاء `hidden`.<br>• المسح `cleared`، والصفحات `page`، وأسباب الترشيح `filtered`، وأزمنة القراءة `reads`.<br>• الإعدادات الفعلية `settings` عند تغيّرها.<br>• أجزاء دورة القراءة (`pass_start`، `stage`): الصفحات، والجوال، والفقاعة، والمناطق. |
 | `core/src/tv_server.rs` | المسار `/tv/drawn` (للتلفاز المرتبط فقط)، وترويسة `X-Ack`، وتسجيل `tv_sent` |
 | `src-tauri/src/capture.rs` | زمن التقاط كل إطار وحجمه (`note_captured`)، وعدّ إطارات المعاينة (`note_preview`) |
 | `src-tauri/src/main.rs` | `mod fork_cmds;`، و`mod replay;`، وأوامر القياس في سطر الأوامر، وتطبيق المفاتيح عند البدء، والإعلان فقط عن تحديثات الأصل في `install_update` |
@@ -112,7 +112,7 @@ git grep -n "fork:" -- core/src/engine.rs core/src/lib.rs core/src/tv_server.rs 
 | `cleared` | مُسح كل المعروض | `reason`: `language` أو `page` |
 | `page` | ظهرت صفحة لعبة أو اختفت | `id`، `on` |
 | `filtered` | نص قُرئ وتُرك، مع سببه | `reason`: `clean` (أحرف أقل من سطر)، `not_centered`، `no_bottom_line`، `help_anchor`، `help_not_sentence`، `not_words`، `reviewed_only` |
-| `reads` | ملخص كل ثانية لأزمنة القراءة واستهلاك المعالج | `n`، `ocr_avg`، `ocr_max`، `pass_avg`، `pass_max`، `areas`، `suppressed`، `cpu_app` (حصة التطبيق من المعالج كله %)، `cpu_all` (حصة النظام كله %)، `fps` (الإطارات الملتقطة فعلًا)، `preview_fps` (إطارات المعاينة المصنوعة فعلًا؛ 0 والمعاينة غير معروضة)، `frame_w` و`frame_h` (حجم إطار القراءة) |
+| `reads` | ملخص كل ثانية لأزمنة القراءة واستهلاك المعالج | `n`، `ocr_avg`، `ocr_max`، `pass_avg`، `pass_max`، `areas`، `suppressed`، `cpu_app` (حصة التطبيق من المعالج كله %)، `cpu_all` (حصة النظام كله %)، `fps` (الإطارات الملتقطة فعلًا)، `preview_fps` (إطارات المعاينة المصنوعة فعلًا؛ 0 والمعاينة غير معروضة)، `frame_w` و`frame_h` (حجم إطار القراءة)، `stages` (زمن كل جزء من الدورة في المتوسط بالمللي ثانية: `setup` و`pages` و`phone` و`chat` و`areas`) |
 | `settings` | الإعدادات الفعلية: عند بدء السجل وعند كل تغيّر | `capture_fps`، `preview_fps`، `picture_4k`، `interval_ms`، `stable_ms`، `clear_after_ms`، `timing_custom` |
 | `tv_sent` | كُتب رد `tv.json` لتلفاز | `tv`، `h` (الإصدار)، `shown` |
 | `tv_drawn` | التلفاز رسم الحالة | `sent`، `recv`، `draw_ms`، `est` (تقدير لحظة الرسم) |

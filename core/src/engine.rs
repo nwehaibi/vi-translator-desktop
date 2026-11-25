@@ -921,6 +921,7 @@ impl Reader {
         }
         let c = ctx.cfg.lock().unwrap().clone();
         let t0 = Instant::now();
+        crate::fork::linelog::pass_start(); // fork: measurement log (the pass's parts: where its time goes)
         // (the player's, or the game's own: see Config::timing)
         let (interval_ms, stable_ms, clear_after_ms) = c.timing();
         // fork: measurement log: the timing in use (written when it changes)
@@ -992,6 +993,7 @@ impl Reader {
             // another resolution: the text sizes are measured again
             sizes.at_resolution(fw, fh);
             if let (Some(frame), Some(ocr)) = (frame, ocr_now) {
+                crate::fork::linelog::stage("pages"); // fork: measurement log
                 // ---- game pages (the game's pages script finds and reads them; pagescript.rs) ----
                 // Appear: each page's `present` (cheap) every frame, then its `read`.
                 // Stay: `same` every frame — the translation stays exactly as long as the page does — with
@@ -1394,6 +1396,7 @@ impl Reader {
             // GTA VI's phone in the hand (WhatUp, Snapmatic): its text beside it (see phone.rs). Each piece
             // from the memory, or the translator (like a page's menu text: asked once, in the background,
             // shown when it comes); the contacts' names written as the speakers' are.
+            crate::fork::linelog::stage("phone"); // fork: measurement log
             if let (Some(f), Some(ocr)) = (frame, ocr_now) {
                 let found = if c.phone_text() {
                     crate::phone::find_screen(&f.rgba, f.w, f.h)
@@ -1664,6 +1667,7 @@ impl Reader {
                     None => {
                         // GTA VI's message bubble at the bottom right (see chat.rs): its translation in a
                         // bubble like it, above it. Read again only when its box changes.
+                        crate::fork::linelog::stage("chat"); // fork: measurement log
                         let chat = if c.phone_text() { crate::chat::find_bubble(&f.rgba, f.w, f.h) } else { None };
                         let bubble = chat.and_then(|r| {
                             let frac_r = screens::Rect { x: r.0 as f64 / f.w as f64, y: r.1 as f64 / f.h as f64, w: r.2 as f64 / f.w as f64, h: r.3 as f64 / f.h as f64 };
@@ -1777,6 +1781,7 @@ impl Reader {
                 }
                 keep
             });
+            crate::fork::linelog::stage("areas"); // fork: measurement log
             for area_cfg in c.areas.iter().filter(|a| a.enabled) {
                 // (an area whose lines stack up is read up to STACK_H above it too: see bottom_stack)
                 let stacks = c.fx(&area_cfg.id).stacks(&area_cfg.id);
@@ -2351,7 +2356,8 @@ fn translate_loop(ctx: Context, latest: Arc<Mutex<HashMap<String, u64>>>, jobs: 
             let texts: Vec<&str> = if job.parts.len() > 1 { job.parts.iter().map(|(t, _)| t.as_str()).collect() } else { vec![job.en.as_str()] };
             let sources: Vec<Option<String>> = {
                 let m = memory.lock().unwrap();
-                texts.iter().map(|t| m.get(t, &[], &[]).map(|(_, src)| src)).collect()
+                let found = |l: &str| m.get(l, &[], &[]).map(|(_, src)| src);
+                texts.iter().map(|t| found(t).or_else(|| speaker::without_name(t).and_then(found)).or_else(|| found(&speaker::sentence_of(t)))).collect()
             };
             let err = result.as_ref().err().map(|e| format!("{e:#}"));
             crate::fork::linelog::emit(
