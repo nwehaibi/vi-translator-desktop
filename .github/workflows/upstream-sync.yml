@@ -1,0 +1,163 @@
+# fork: the original app's updates brought into this copy once a week (see FORK.md), never merged
+# without you:
+# 1. the original's latest commit (vi-translator/vi-translator-desktop, main) merged into the branch
+#    sync/auto, made again from this copy's default branch each time; the base moved on
+#    (.fork/base-commit) and the guard run (.fork/guard.sh: the translation memory's files etc. stay
+#    the original's);
+# 2. the tests on Windows (as the original's release runs them);
+# 3. a pull request from sync/auto to review and merge by hand. Anything else — conflicts with this
+#    copy's changes, failing tests, a workflow file the original changed (GitHub's own token may not
+#    push those) — an issue saying what (label "upstream-sync").
+#
+# Optional repository secret SYNC_TOKEN: a token with write access to this repository's contents,
+# pull requests and workflows, used to push sync/auto (needed only when the original changes its
+# workflow files). Without it, GitHub's own token; for the pull request, "Allow GitHub Actions to create
+# and approve pull requests" (Settings → Actions → General) must be on, else an issue links the branch.
+name: Upstream sync
+
+on:
+  schedule:
+    - cron: "17 3 * * 1" # Mondays, 03:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/vi-translator/vi-translator-desktop.git
+  UPSTREAM_BRANCH: main
+  SYNC_BRANCH: sync/auto
+
+jobs:
+  merge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      status: ${{ steps.merge.outputs.status }}
+      upstream: ${{ steps.merge.outputs.upstream }}
+      files: ${{ steps.merge.outputs.files }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Merge the original's updates
+        id: merge
+        env:
+          HAS_SYNC_TOKEN: ${{ secrets.SYNC_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --no-tags "$UPSTREAM" "$UPSTREAM_BRANCH"
+          up="$(git rev-parse FETCH_HEAD)"
+          echo "upstream=$up" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$up" HEAD; then
+            echo "Nothing new from the original (${up})"
+            echo "status=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          before="$(git rev-parse HEAD)"
+          git checkout -B "$SYNC_BRANCH"
+          if ! git merge --no-ff --no-edit -m "Merge the original's updates (${up:0:7})" "$up"; then
+            files="$(git diff --name-only --diff-filter=U | tr '\n' ' ')"
+            git merge --abort
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+            echo "files=${files}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf '%s\n' "$up" > .fork/base-commit
+          git add .fork/base-commit
+          git commit -m "fork: based on the original's ${up:0:7}"
+          if ! bash .fork/guard.sh; then
+            echo "status=guard" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          workflows="$(git diff --name-only "$before" HEAD -- .github/workflows | tr '\n' ' ')"
+          if [ -n "$workflows" ] && [ "$HAS_SYNC_TOKEN" != "true" ]; then
+            echo "status=workflows" >> "$GITHUB_OUTPUT"
+            echo "files=${workflows}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git push --force origin "$SYNC_BRANCH"
+          echo "status=merged" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: merge
+    if: needs.merge.outputs.status == 'merged'
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.SYNC_BRANCH }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Test
+        run: cargo test
+
+  report:
+    needs: [merge, test]
+    if: always() && needs.merge.outputs.status != 'none' && needs.merge.result != 'skipped'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Pull request or issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          STATUS: ${{ needs.merge.outputs.status }}
+          MERGE_RESULT: ${{ needs.merge.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          UP: ${{ needs.merge.outputs.upstream }}
+          FILES: ${{ needs.merge.outputs.files }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          short="${UP:0:7}"
+          # (a scheduled run's event doesn't name the default branch)
+          DEFAULT="$(gh repo view "$REPO" --json defaultBranchRef --jq .defaultBranchRef.name)"
+          issue() {
+            gh label create upstream-sync --repo "$REPO" --color 5319e7 --description "Updates of the original app" --force >/dev/null || true
+            open="$(gh issue list --repo "$REPO" --label upstream-sync --state open --json number --jq '.[0].number // empty' || true)"
+            if [ -n "$open" ]; then
+              gh issue comment "$open" --repo "$REPO" --body "$2"
+            else
+              gh issue create --repo "$REPO" --label upstream-sync --title "$1" --body "$2"
+            fi
+          }
+          if [ "$MERGE_RESULT" != "success" ]; then
+            issue "تحديثات التطبيق الأصلي: تعذّر الدمج" "تعذّر تشغيل دمج تحديثات التطبيق الأصلي (${short:-?}). التفاصيل: $RUN"
+          elif [ "$STATUS" = "conflict" ]; then
+            issue "تحديثات التطبيق الأصلي (${short}): تعارضات" "تحديثات التطبيق الأصلي حتى ${short} تتعارض مع تعديلات هذه النسخة في: ${FILES}. لم يُدمج شيء؛ تحتاج دمجًا يدويًا (راجع FORK.md: مزامنة التحديثات). التفاصيل: $RUN"
+          elif [ "$STATUS" = "guard" ]; then
+            issue "تحديثات التطبيق الأصلي (${short}): فشل الحارس" "بعد دمج تحديثات التطبيق الأصلي حتى ${short} لم تعد ملفات الذاكرة أو المفتاح أو المعرّف كما في الأصل (.fork/guard.sh). لم يُدفع شيء. التفاصيل: $RUN"
+          elif [ "$STATUS" = "workflows" ]; then
+            issue "تحديثات التطبيق الأصلي (${short}): ملفات سير عمل" "تحديثات التطبيق الأصلي حتى ${short} تغيّر ملفات سير العمل (${FILES})، ورمز GitHub التلقائي لا يملك صلاحية دفعها. أضف السر SYNC_TOKEN (انظر FORK.md) أو ادمج يدويًا. التفاصيل: $RUN"
+          elif [ "$TEST_RESULT" != "success" ]; then
+            issue "تحديثات التطبيق الأصلي (${short}): فشلت الاختبارات" "دُمجت تحديثات التطبيق الأصلي حتى ${short} في الفرع ${SYNC_BRANCH}، لكن الاختبارات على Windows لم تنجح (${TEST_RESULT}). لا تدمجه قبل الإصلاح. التفاصيل: $RUN"
+          else
+            body="تحديثات التطبيق الأصلي حتى ${short}، مدموجة في ${SYNC_BRANCH}: الحارس نجح (ملفات الذاكرة والمفتاح والمعرّف كما في الأصل)، واختبارات Windows نجحت. راجع التغييرات ثم ادمج يدويًا. التفاصيل: $RUN"
+            existing="$(gh pr list --repo "$REPO" --head "$SYNC_BRANCH" --state open --json number --jq '.[0].number // empty' || true)"
+            if [ -n "$existing" ]; then
+              gh pr comment "$existing" --repo "$REPO" --body "$body"
+            elif ! gh pr create --repo "$REPO" --base "$DEFAULT" --head "$SYNC_BRANCH" --title "تحديثات التطبيق الأصلي حتى ${short}" --body "$body"; then
+              issue "تحديثات التطبيق الأصلي (${short}): جاهزة للمراجعة" "${body} لم يُسمح بإنشاء طلب الدمج تلقائيًا؛ أنشئه من: ${{ github.server_url }}/${REPO}/compare/${DEFAULT}...${SYNC_BRANCH}"
+            fi
+          fi

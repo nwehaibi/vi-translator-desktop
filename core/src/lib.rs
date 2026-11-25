@@ -10,6 +10,8 @@
 
 pub mod config;
 pub mod engine;
+// fork: the Xbox fork's own additions (core/src/fork, FORK.md)
+pub mod fork;
 pub mod frame;
 pub mod game_icons;
 pub mod lan_page;

@@ -226,6 +226,7 @@ impl Shared {
             None => (w, h, rgba),
         };
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        vi_translator_core::fork::linelog::note_frame(seq, vi_translator_core::fork::linelog::unix_ms()); // fork: measurement log
         *self.frame.lock().unwrap() = Some(Arc::new(FrameData { w, h, rgba, seq }));
     }
     /// Store a preview frame (small RGBA; the preview thread turns it into JPEG).

@@ -1,0 +1,54 @@
+# fork: the Xbox copy's checks on every push (see FORK.md): what it never changes in the original app
+# (.fork/guard.sh), the core's tests (the original's and the copy's), and the translation memory
+# answering exactly as the original's does (the same synthetic memory and download loaded by the
+# original's core and by this copy's: every answer compared).
+name: Fork guard
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-guard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      # (all the history: the original version it's based on, .fork/base-commit)
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: The original's files unchanged
+        run: bash .fork/guard.sh
+
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: The core's tests
+        run: cargo test -p vi-translator-core
+
+      # (the tool builds from the same file in both: it uses only what the original's core has)
+      - name: The translation memory answers as the original's
+        run: |
+          set -euo pipefail
+          base="$(tr -d '[:space:]' < .fork/base-commit)"
+          git worktree add --detach ../vit-base "$base"
+          mkdir -p ../vit-base/core/examples
+          cp core/examples/fork_memory_equivalence.rs ../vit-base/core/examples/
+          tool() { cargo run -q -p vi-translator-core --example fork_memory_equivalence -- "$@"; }
+          tool sample "$RUNNER_TEMP/memeq"
+          (cd ../vit-base && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo run -q -p vi-translator-core --example fork_memory_equivalence -- \
+            dump --db "$RUNNER_TEMP/memeq/db" --pack-jsonl "$RUNNER_TEMP/memeq/pack.jsonl" --out "$RUNNER_TEMP/memeq/original.jsonl")
+          tool dump --db "$RUNNER_TEMP/memeq/db" --pack-jsonl "$RUNNER_TEMP/memeq/pack.jsonl" --out "$RUNNER_TEMP/memeq/fork.jsonl"
+          tool compare "$RUNNER_TEMP/memeq/original.jsonl" "$RUNNER_TEMP/memeq/fork.jsonl"

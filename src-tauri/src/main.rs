@@ -24,6 +24,10 @@ mod updater;
 mod vcam;
 // Xbox remote play in a window of the app (Microsoft's web player)
 mod xbox;
+// fork: the Xbox fork's commands (its switches, the measurement log; see FORK.md)
+mod fork_cmds;
+// fork: the measurement tools (--replay-video, --evaluate, --gold-draft; see FORK.md)
+mod replay;
 // PS5 remote play in the app (chiaki-ng)
 mod ps5;
 
@@ -275,6 +279,11 @@ fn update_status(state: tauri::State<AppState>) -> Option<updater::Update> {
 #[tauri::command]
 async fn install_update(app: AppHandle, webview: tauri::Webview, state: tauri::State<'_, AppState>) -> Result<(), String> {
     main_only(&webview)?;
+    // fork: updates of the original app are only announced (installing one would replace this build and
+    // its Xbox support), unless the fork's switch says otherwise (fork-settings.json)
+    if !fork_cmds::installs_upstream_updates() {
+        return Err(fork_cmds::NOTIFY_ONLY.into());
+    }
     let u = state.update.lock().unwrap().clone().ok_or("no update available")?;
     // VI Translator.app (the .dmg's): its update is the new .dmg, on the release's page
     if u.app_bundle {
@@ -1477,6 +1486,10 @@ fn test_image(path: &str, area_id: &str) -> anyhow::Result<()> {
 fn main() {
     move_old_folders();
     let args: Vec<String> = std::env::args().collect();
+    // fork: the measurement tools (--replay-video, --evaluate, --gold-draft; see FORK.md)
+    if let Some(code) = replay::cli(&args) {
+        std::process::exit(code);
+    }
     // `--screen-copy "Window title" out.png`: copy that window's area of the screen (overlays included).
     if let Some(i) = args.iter().position(|a| a == "--screen-copy") {
         let (Some(title), Some(out)) = (args.get(i + 1), args.get(i + 2)) else { std::process::exit(2) };
@@ -1830,12 +1843,14 @@ fn main() {
     let shared = Arc::new(Shared::default());
     // the TVs connected to show the overlays, and their keys (their own file, not the settings)
     shared.tvs.load(data_dir().join("tvs.json"));
+    // fork: the fork's switches (fork-settings.json: all off by default) and the measurement log
+    fork_cmds::apply(&data_dir(), &vi_translator_core::fork::settings::load(&data_dir()));
     let update: Arc<Mutex<Option<updater::Update>>> = Arc::new(Mutex::new(None));
 
     tauri::Builder::default()
         .plugin(hotkey::plugin())
         .manage(AppState { cfg: cfg.clone(), shared: shared.clone(), saver: saver.clone(), memory: memory.clone(), update: update.clone() })
-        .invoke_handler(tauri::generate_handler![app_version, dev_build, dev_report, has_offline, memory_line, memory_probe, get_phone, update_status, install_update, lan_info, open_lan_page, find_tvs, connect_tv, list_tvs, remove_tv, list_langs, list_sources, window_still, find_picture, vcam_status, sound_inputs, sound_status, set_snap_hotkey, back_to_game, get_config, save_config, page_options, list_windows, list_screens, list_fonts, get_screen, frame_saver_status, open_frames_folder, save_preview, open_previews_folder, take_snapshot, save_snapshot_render, open_snapshots_folder, perf_status, memory_status, memory_clear, open_xbox, ps5_status, ps5_sign_in, ps5_browser_sign_in, ps5_login_url, ps5_sign_in_address, ps5_set_account, ps5_wake, ps5_set_sound, ps5_set_resolution, ps5_sign_out, ps5_find, ps5_link, ps5_forget, ps5_login_pin])
+        .invoke_handler(tauri::generate_handler![app_version, dev_build, dev_report, has_offline, memory_line, memory_probe, get_phone, update_status, install_update, lan_info, open_lan_page, find_tvs, connect_tv, list_tvs, remove_tv, list_langs, list_sources, window_still, find_picture, vcam_status, sound_inputs, sound_status, set_snap_hotkey, back_to_game, get_config, save_config, page_options, list_windows, list_screens, list_fonts, get_screen, frame_saver_status, open_frames_folder, save_preview, open_previews_folder, take_snapshot, save_snapshot_render, open_snapshots_folder, perf_status, memory_status, memory_clear, open_xbox, ps5_status, ps5_sign_in, ps5_browser_sign_in, ps5_login_url, ps5_sign_in_address, ps5_set_account, ps5_wake, ps5_set_sound, ps5_set_resolution, ps5_sign_out, ps5_find, ps5_link, ps5_forget, ps5_login_pin, fork_cmds::fork_settings_get, fork_cmds::fork_settings_set, fork_cmds::fork_open_log_folder, fork_cmds::fork_open_update_page])
         .setup(move |app| {
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.set_title(&format!("VI Translator {}", env!("CARGO_PKG_VERSION")));
