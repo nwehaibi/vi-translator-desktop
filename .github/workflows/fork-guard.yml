@@ -52,3 +52,20 @@ jobs:
             dump --db "$RUNNER_TEMP/memeq/db" --pack-jsonl "$RUNNER_TEMP/memeq/pack.jsonl" --out "$RUNNER_TEMP/memeq/original.jsonl")
           tool dump --db "$RUNNER_TEMP/memeq/db" --pack-jsonl "$RUNNER_TEMP/memeq/pack.jsonl" --out "$RUNNER_TEMP/memeq/fork.jsonl"
           tool compare "$RUNNER_TEMP/memeq/original.jsonl" "$RUNNER_TEMP/memeq/fork.jsonl"
+
+      # (where the original's approximate lookup itself differs from run to run — lines as close, more
+      # than the 600 candidates it compares — the lines the memory has, the counts and what the memory
+      # file keeps must still be the same: compare's exit 0 or 1, never 2)
+      - name: The memory the same where approximate lookups vary
+        run: |
+          set -euo pipefail
+          tool() { cargo run -q -p vi-translator-core --example fork_memory_equivalence -- "$@"; }
+          tool sample-ties "$RUNNER_TEMP/ties"
+          (cd ../vit-base && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo run -q -p vi-translator-core --example fork_memory_equivalence -- \
+            dump --db "$RUNNER_TEMP/ties/db" --out "$RUNNER_TEMP/ties/original.jsonl")
+          tool dump --db "$RUNNER_TEMP/ties/db" --out "$RUNNER_TEMP/ties/fork.jsonl"
+          set +e
+          tool compare "$RUNNER_TEMP/ties/original.jsonl" "$RUNNER_TEMP/ties/fork.jsonl"
+          code=$?
+          set -e
+          if [ "$code" -ge 2 ]; then echo "::error::the lines the memory has, the counts or the memory file differ"; exit 1; fi

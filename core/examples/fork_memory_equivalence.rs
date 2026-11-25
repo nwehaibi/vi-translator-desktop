@@ -25,9 +25,20 @@
 //!   `--pack-jsonl`: a download as plain entries instead (the synthetic test). The folders are only read:
 //!   the memory is loaded from a temporary copy (loading may convert an old file; a download rewrites the
 //!   memory file).
-//! - `compare <a.jsonl> <b.jsonl>`: the differences (exit 1 if any).
+//! - `compare <a.jsonl> <b.jsonl> [--label <name>] [--summary-to <file>]`: the differences, by kind:
+//!   - the lookups of the lines the memory and the download have (exact: the key itself), the counts
+//!     (the head) and what the memory file keeps: these say whether the memory is the same;
+//!   - the lookups of misreadings (approximate: `near`), apart, by how they differ. The original core's
+//!     approximate lookup is not the same from one run to the next: it compares at most 600 candidates
+//!     (memory.rs NEAR_TRIES), in the order of a HashMap (Rust's: seeded at random in each process), and
+//!     among equally close lines the first one compared wins. So two runs of the same core can answer a
+//!     misreading differently — the original's against itself too (`memory-check.cmd` measures it).
+//!   Exit 0: all the same; 1: only misreadings differ; 2: exact lookups, counts or the file differ;
+//!   3: a file could not be read.
 //! - `sample <folder>`: synthetic inputs (a memory of every source, reviewed lines, a download that
 //!   replaces some), for the tool's own test: `<folder>/db` and `<folder>/pack.jsonl`.
+//! - `sample-ties <folder>`: synthetic inputs where the approximate lookup has ties and more than 600
+//!   candidates (as some misreadings in a player's memory do): `<folder>/db`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -54,7 +65,18 @@ fn main() {
         }
         Some("compare") => {
             let (Some(a), Some(b)) = (args.get(1), args.get(2)) else { usage() };
-            compare(Path::new(a), Path::new(b))
+            let label = opt("--label").unwrap_or_else(|| format!("{a} / {b}"));
+            compare(Path::new(a), Path::new(b), &label, opt("--summary-to").map(PathBuf::from))
+        }
+        Some("sample-ties") => {
+            let Some(dir) = args.get(1) else { usage() };
+            match sample_ties(Path::new(dir)) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    1
+                }
+            }
         }
         Some("sample") => {
             let Some(dir) = args.get(1) else { usage() };
@@ -73,7 +95,7 @@ fn main() {
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  dump --db <folder> [--data <folder> | --pack-jsonl <file>] [--game <id>] [--lang ar] [--variants 2000] --out <file>\n  compare <a.jsonl> <b.jsonl>\n  sample <folder>"
+        "usage:\n  dump --db <folder> [--data <folder> | --pack-jsonl <file>] [--game <id>] [--lang ar] [--variants 2000] --out <file>\n  compare <a.jsonl> <b.jsonl> [--label <name>] [--summary-to <file>]\n  sample <folder>\n  sample-ties <folder>"
     );
     std::process::exit(2);
 }
@@ -205,6 +227,8 @@ fn dump(db: &Path, data: Option<PathBuf>, pack_jsonl: Option<PathBuf>, game: Opt
             probes.extend(entries.iter().map(|e| e.en.clone()).filter(|k| !k.is_empty()));
             m.set_shared(lang, entries);
         }
+        // (the lines the memory and the download have: their lookups are of the key itself)
+        let keys_of_memory: BTreeSet<String> = probes.clone();
         // misreadings of a sample (the same lines every time: every n-th, in order)
         let keys: Vec<String> = probes.iter().cloned().collect();
         let step = (keys.len() / n_variants.max(1)).max(1);
@@ -226,7 +250,8 @@ fn dump(db: &Path, data: Option<PathBuf>, pack_jsonl: Option<PathBuf>, game: Opt
         for q in &probes {
             let got = m.get(q, &icons, &[]).map(|(segs, src)| json!([fingerprint(&memory::slot_text(&segs)), src]));
             found += usize::from(got.is_some());
-            lines.push(json!({ "q": q, "get": got, "line_of": m.line_of(q) }));
+            let kind = if keys_of_memory.contains(q) { "key" } else { "misreading" };
+            lines.push(json!({ "q": q, "kind": kind, "get": got, "line_of": m.line_of(q) }));
         }
         // what the memory file keeps (sorted: its order is the order lines were added)
         let mut kept: Vec<(String, String, String)> = file_entries(&work.join(format!("memory-{lang}.dat")), lang).into_iter().map(|e| (e.en, fingerprint(&e.ar), e.source)).collect();
@@ -246,7 +271,8 @@ fn dump(db: &Path, data: Option<PathBuf>, pack_jsonl: Option<PathBuf>, game: Opt
     result
 }
 
-fn compare(a: &Path, b: &Path) -> i32 {
+/// How two dumps differ, by kind (see the top of this file).
+fn compare(a: &Path, b: &Path, label: &str, summary_to: Option<PathBuf>) -> i32 {
     let read = |p: &Path| -> Result<BTreeMap<String, Value>, String> {
         let text = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
         let mut out = BTreeMap::new();
@@ -262,28 +288,123 @@ fn compare(a: &Path, b: &Path) -> i32 {
         (Ok(x), Ok(y)) => (x, y),
         (Err(e), _) | (_, Err(e)) => {
             eprintln!("error: {e}");
-            return 2;
+            return 3;
         }
     };
-    let keys: BTreeSet<&String> = x.keys().chain(y.keys()).collect();
-    let mut diffs = 0;
-    for k in keys {
-        let (va, vb) = (x.get(k), y.get(k));
-        if va != vb {
-            diffs += 1;
-            if diffs <= 20 {
-                eprintln!("differs: {k}\n  a: {}\n  b: {}", va.map_or("(missing)".into(), |v| v.to_string()), vb.map_or("(missing)".into(), |v| v.to_string()));
+    // a lookup's kind: as the dump says, or — a dump from before — a key when either side found the line
+    // itself (an exact lookup)
+    let kind_of = |q: &str, va: Option<&Value>, vb: Option<&Value>| -> &'static str {
+        if let Some(k) = va.or(vb).and_then(|v| v["kind"].as_str()) {
+            return if k == "key" { "key" } else { "misreading" };
+        }
+        let key = memory::key_of(q);
+        let exact = |v: Option<&Value>| v.is_some_and(|v| v["line_of"].as_str() == Some(key.as_str()));
+        if exact(va) || exact(vb) { "key" } else { "misreading" }
+    };
+    let (mut keys_total, mut misreadings_total) = (0usize, 0usize);
+    for (k, v) in &x {
+        if let Some(q) = k.strip_prefix("q:") {
+            if kind_of(q, Some(v), y.get(k)) == "key" {
+                keys_total += 1;
+            } else {
+                misreadings_total += 1;
             }
         }
     }
-    let lookups = x.keys().filter(|k| k.starts_with("q:")).count();
-    if diffs == 0 {
-        eprintln!("identical: {lookups} lookups, the head and what the file keeps");
-        0
-    } else {
-        eprintln!("{diffs} differences (of {lookups} lookups, the head and the file)");
-        1
+    // the differences, each in its class
+    let mut classes: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    let all: BTreeSet<&String> = x.keys().chain(y.keys()).collect();
+    for k in all {
+        let (va, vb) = (x.get(k), y.get(k));
+        if va == vb {
+            continue;
+        }
+        let show = || format!("{k}\n      a: {}\n      b: {}", va.map_or("(missing)".into(), |v| v.to_string()), vb.map_or("(missing)".into(), |v| v.to_string()));
+        let class = match k.strip_prefix("q:") {
+            None if k == "head" => "head (the counts)",
+            None => "file (what the memory file keeps)",
+            Some(q) if kind_of(q, va, vb) == "key" => "keys (exact lookups)",
+            Some(_) => {
+                let got = |v: Option<&Value>| v.map(|v| v["get"].clone()).unwrap_or(Value::Null);
+                let (ga, gb) = (got(va), got(vb));
+                if ga.is_null() || gb.is_null() {
+                    "misreading: found by one run only"
+                } else if ga == gb {
+                    "misreading: another line, the same translation and source"
+                } else if ga[0] == gb[0] {
+                    "misreading: the same translation, another source"
+                } else {
+                    "misreading: another translation"
+                }
+            }
+        };
+        classes.entry(class).or_default().push(show());
     }
+    let count = |prefix: &str| classes.iter().filter(|(c, _)| c.starts_with(prefix)).map(|(_, v)| v.len()).sum::<usize>();
+    let (keys, head, file, misreadings) = (count("keys"), count("head"), count("file"), count("misreading"));
+    eprintln!("compare: {label}");
+    eprintln!("  keys (exact lookups):           {keys} different of {keys_total}");
+    eprintln!("  head (the counts):              {}", if head == 0 { "the same" } else { "DIFFERENT" });
+    eprintln!("  file (what the memory keeps):   {}", if file == 0 { "the same" } else { "DIFFERENT" });
+    eprintln!("  misreadings (approximate):      {misreadings} different of {misreadings_total}");
+    for (c, v) in classes.iter().filter(|(c, _)| c.starts_with("misreading")) {
+        eprintln!("      {:<56} {}", c.trim_start_matches("misreading: "), v.len());
+    }
+    // a few of each, the exact ones first
+    for (c, v) in &classes {
+        eprintln!("  {c}, e.g.:");
+        for s in v.iter().take(if c.starts_with("misreading") { 2 } else { 10 }) {
+            eprintln!("    {s}");
+        }
+    }
+    let exact_same = keys == 0 && head == 0 && file == 0;
+    let line = format!(
+        "{label}: keys {keys}/{keys_total} different, head {}, file {}; misreadings {misreadings}/{misreadings_total} different ({})",
+        if head == 0 { "same" } else { "DIFFERENT" },
+        if file == 0 { "same" } else { "DIFFERENT" },
+        classes.iter().filter(|(c, _)| c.starts_with("misreading")).map(|(c, v)| format!("{} {}", c.trim_start_matches("misreading: "), v.len())).collect::<Vec<_>>().join(", ")
+    );
+    if let Some(f) = summary_to {
+        use std::io::Write as _;
+        if let Ok(mut out) = std::fs::OpenOptions::new().create(true).append(true).open(&f) {
+            let _ = writeln!(out, "{line}");
+        }
+    }
+    if exact_same && misreadings == 0 {
+        eprintln!("RESULT: identical");
+        0
+    } else if exact_same {
+        eprintln!("RESULT: keys, sources and file the same; misreadings differ ({misreadings})");
+        1
+    } else {
+        eprintln!("RESULT: DIFFERENT in keys, counts or file");
+        2
+    }
+}
+
+/// Synthetic inputs where the approximate lookup is not the same from one run to the next, in the ways a
+/// player's memory showed: two lines as close to a misreading (with another translation, or the same),
+/// and a misreading whose candidates are more than the 600 compared (many lines with its one known word).
+fn sample_ties(dir: &Path) -> Result<(), String> {
+    let db = dir.join("db");
+    let _ = std::fs::remove_dir_all(&db);
+    std::fs::create_dir_all(&db).map_err(|e| e.to_string())?;
+    let mut lines = vec![
+        json!({ "en": "where you at bro", "ar": "أين أنت يا أخي", "source": "reviewed" }),
+        json!({ "en": "where you at boy", "ar": "أين أنت يا ولد", "source": "reviewed" }),
+        json!({ "en": "motor upgrade stage 4", "ar": "ترقية المحرك المرحلة 4", "source": "reviewed" }),
+        json!({ "en": "motor upgrade stage 2", "ar": "ترقية المحرك المرحلة 2", "source": "reviewed" }),
+        json!({ "en": "hey how ya doin'", "ar": "مرحبًا، كيف حالك", "source": "reviewed" }),
+        json!({ "en": "hey how ya doing", "ar": "مرحبًا، كيف حالك", "source": "reviewed" }),
+        json!({ "en": "c'mon what now", "ar": "هيا، ماذا الآن", "source": "reviewed" }),
+    ];
+    // (1500 lines with "now", as long as "c'monwhat now": its candidates, all as good)
+    for i in 0..1500 {
+        lines.push(json!({ "en": format!("zq{i:04} ab now"), "ar": format!("سطر {i}"), "source": "reviewed" }));
+    }
+    std::fs::write(db.join("reviewed.jsonl"), lines.iter().map(|v| format!("{v}\n")).collect::<String>()).map_err(|e| e.to_string())?;
+    eprintln!("sample-ties: {}", db.display());
+    Ok(())
 }
 
 /// Synthetic inputs: a memory with lines of every source (one twice, the better kept), reviewed lines (one
