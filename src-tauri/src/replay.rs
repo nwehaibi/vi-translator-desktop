@@ -318,7 +318,7 @@ fn replay(video: &str, o: &ReplayOptions) -> anyhow::Result<()> {
                     std::thread::sleep(wait);
                 }
                 n += 1;
-                linelog::note_frame(n, linelog::unix_ms());
+                linelog::note_captured(n, w, h);
                 *latest.lock().unwrap() = Some(Arc::new(FrameData { w, h, rgba: buf, seq: n }));
             }
             done.store(true, Ordering::Relaxed);
@@ -350,7 +350,7 @@ fn replay(video: &str, o: &ReplayOptions) -> anyhow::Result<()> {
                 break;
             }
             tail_seq += 1;
-            linelog::note_frame(tail_seq, linelog::unix_ms());
+            linelog::note_captured(tail_seq, w, h);
             frame = Some(Arc::new(FrameData { w, h, rgba: black.rgba.clone(), seq: tail_seq }));
         }
         let wait = match &frame {
@@ -947,23 +947,54 @@ pub fn session_summary(events: &[Value]) -> Value {
     }
     let latency = |e: &Value| Some(t(e).checked_sub(e["at"].as_u64()?)? as f64);
     // minute by minute: the CPU, the reading, the lines and how fast they went up
-    let mut minutes: BTreeMap<u64, (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    #[derive(Default)]
+    struct Minute {
+        app: Vec<f64>,
+        all: Vec<f64>,
+        pass: Vec<f64>,
+        preview: Vec<f64>,
+        latency: Vec<f64>,
+    }
+    let mut minutes: BTreeMap<u64, Minute> = BTreeMap::new();
     for e in events {
         let m = (t(e).saturating_sub(t0)) / 60_000;
         let slot = minutes.entry(m).or_default();
         if e["ev"] == "reads" {
-            slot.0.extend(e["cpu_app"].as_f64());
-            slot.1.extend(e["cpu_all"].as_f64());
-            slot.2.extend(e["pass_avg"].as_f64());
+            slot.app.extend(e["cpu_app"].as_f64());
+            slot.all.extend(e["cpu_all"].as_f64());
+            slot.pass.extend(e["pass_avg"].as_f64());
+            slot.preview.extend(e["preview_fps"].as_f64());
         } else if e["ev"] == "shown" {
-            slot.3.extend(latency(e));
+            slot.latency.extend(latency(e));
         }
     }
     let avg = |v: &[f64]| if v.is_empty() { Value::Null } else { json!((v.iter().sum::<f64>() / v.len() as f64 * 10.0).round() / 10.0) };
     let timeline: Vec<Value> = minutes
         .iter()
-        .map(|(m, (app, all, pass, lat))| json!({ "minute": m, "cpu_app_pct": avg(app), "cpu_all_pct": avg(all), "pass_avg_ms": avg(pass), "shown": lat.len(), "latency_ms_avg": avg(lat) }))
+        .map(|(m, x)| {
+            json!({
+                "minute": m, "cpu_app_pct": avg(&x.app), "cpu_all_pct": avg(&x.all), "pass_avg_ms": avg(&x.pass),
+                "preview_fps": avg(&x.preview), "shown": x.latency.len(), "latency_ms_avg": avg(&x.latency),
+            })
+        })
         .collect();
+    // the settings in use, each from when it was (the log says them when it starts and when they change)
+    let settings: Vec<Value> = of("settings")
+        .map(|e| {
+            let mut v = e.clone();
+            if let Some(o) = v.as_object_mut() {
+                o.remove("ev");
+            }
+            v
+        })
+        .collect();
+    // the sizes read for text (the game window's)
+    let mut sizes: BTreeMap<String, u64> = BTreeMap::new();
+    for e in of("reads") {
+        if let (Some(w), Some(h)) = (e["frame_w"].as_u64(), e["frame_h"].as_u64()) {
+            *sizes.entry(format!("{w}x{h}")).or_default() += 1;
+        }
+    }
     json!({
         "from_unix_ms": t0, "to_unix_ms": t1, "minutes": ((t1 - t0) as f64 / 60_000.0 * 10.0).round() / 10.0,
         "counts": {
@@ -984,6 +1015,11 @@ pub fn session_summary(events: &[Value]) -> Value {
         "cpu_app_pct": spread(&nums("reads", &|e| e["cpu_app"].as_f64())),
         "cpu_all_pct": spread(&nums("reads", &|e| e["cpu_all"].as_f64())),
         "fps": spread(&nums("reads", &|e| e["fps"].as_f64())),
+        // (the picture in the app's window: 0 while it isn't watched)
+        "preview_fps": spread(&nums("reads", &|e| e["preview_fps"].as_f64())),
+        "preview_on_seconds": of("reads").filter(|e| e["preview_fps"].as_f64().is_some_and(|p| p > 0.0)).count(),
+        "frame_sizes_seconds": sizes,
+        "settings": settings,
         "pass_avg_ms": spread(&nums("reads", &|e| e["pass_avg"].as_f64())),
         "ocr_avg_ms": spread(&nums("reads", &|e| e["ocr_avg"].as_f64())),
         "tv": {
@@ -1153,12 +1189,13 @@ mod tests {
     fn fork_a_sessions_log_is_summed_up() {
         let s = 2_000_000u64;
         let events = vec![
-            ev("reads", json!({ "cpu_app": 20.0, "cpu_all": 60.0, "fps": 12.0, "pass_avg": 90.0, "ocr_avg": 30.0, "t": s })),
+            ev("settings", json!({ "capture_fps": 12, "preview_fps": 60, "picture_4k": true, "interval_ms": 16, "stable_ms": 0, "clear_after_ms": 70, "timing_custom": false, "t": s })),
+            ev("reads", json!({ "cpu_app": 20.0, "cpu_all": 60.0, "fps": 12.0, "preview_fps": 58.0, "frame_w": 2560, "frame_h": 1600, "pass_avg": 90.0, "ocr_avg": 30.0, "t": s })),
             ev("seen", json!({ "area": "subtitles", "captured": s + 900, "t": s + 1000 })),
             ev("translated", json!({ "area": "subtitles", "seq": 1, "ok": true, "hit": true, "ms": 0.4, "t": s + 1010 })),
             ev("shown", json!({ "area": "subtitles", "seq": 1, "at": s + 1000, "late": false, "t": s + 1150 })),
             ev("filtered", json!({ "area": "subtitles", "reason": "clean", "t": s + 2000 })),
-            ev("reads", json!({ "cpu_app": 40.0, "cpu_all": 80.0, "fps": 12.0, "pass_avg": 110.0, "ocr_avg": 35.0, "t": s + 61_000 })),
+            ev("reads", json!({ "cpu_app": 40.0, "cpu_all": 80.0, "fps": 12.0, "preview_fps": 0.0, "frame_w": 2560, "frame_h": 1600, "pass_avg": 110.0, "ocr_avg": 35.0, "t": s + 61_000 })),
             ev("tv_drawn", json!({ "sent": (s + 1200) as f64, "est": (s + 1260) as f64, "draw_ms": 30.0, "t": s + 1300 })),
         ];
         let r = session_summary(&events);
@@ -1169,6 +1206,10 @@ mod tests {
         assert_eq!(r["tv"]["sent_to_drawn_ms"]["p50"], 60.0);
         assert_eq!(r["filtered"]["clean"], 1);
         assert_eq!(r["timeline"].as_array().map(Vec::len), Some(2), "minute by minute");
+        assert_eq!(r["settings"][0]["picture_4k"], true);
+        assert_eq!(r["preview_on_seconds"], 1, "the preview made frames one second of two");
+        assert_eq!(r["frame_sizes_seconds"]["2560x1600"], 2);
+        assert_eq!(r["timeline"][0]["preview_fps"], 58.0);
     }
 
     #[test]

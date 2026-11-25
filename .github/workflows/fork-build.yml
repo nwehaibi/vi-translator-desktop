@@ -29,9 +29,10 @@ on:
 permissions:
   contents: read
 
+# (a push while a build runs waits for it, the newest waiting one only: a running build is never cut short)
 concurrency:
   group: fork-build-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:

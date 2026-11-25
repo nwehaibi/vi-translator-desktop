@@ -923,6 +923,12 @@ impl Reader {
         let t0 = Instant::now();
         // (the player's, or the game's own: see Config::timing)
         let (interval_ms, stable_ms, clear_after_ms) = c.timing();
+        // fork: measurement log: the timing in use (written when it changes)
+        if crate::fork::linelog::on() {
+            let custom = c.timing_custom == Some(true);
+            let (capture_fps, preview_fps, picture_4k) = (c.capture_fps, c.preview_fps, c.picture_4k);
+            crate::fork::linelog::note_settings(crate::fork::linelog::Settings { capture_fps, preview_fps, picture_4k, interval_ms, stable_ms, clear_after_ms, custom });
+        }
         if c.target_lang != last_lang {
             // another language: everything shown and cached is in the old one
             last_lang = c.target_lang.clone();

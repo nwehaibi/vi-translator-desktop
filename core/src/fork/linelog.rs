@@ -59,6 +59,10 @@ pub fn on() -> bool {
 
 fn refresh(s: &Sinks) {
     ON.store(s.file.is_some() || s.collector.is_some(), Ordering::Relaxed);
+    // (a log started again says the settings in use again, and its per-second readings start afresh: not
+    // over the time it was off)
+    *SETTINGS.lock().unwrap() = None;
+    *READS.lock().unwrap() = None;
 }
 
 /// Write the log to `path` (None: stop writing it), rotating at `max_mb` MB.
@@ -172,6 +176,60 @@ pub fn norm(text: &str) -> String {
 
 // ------------------------------------------------------------------------------------- frames
 
+/// A full frame was captured now: its number, and its size (the size read for text: the game window's own
+/// for a window). (The capture's hook: `note_frame` with the time, and the size for the per-second readings.)
+pub fn note_captured(seq: u64, w: u32, h: u32) {
+    if !on() {
+        return;
+    }
+    FRAME_W.store(w, Ordering::Relaxed);
+    FRAME_H.store(h, Ordering::Relaxed);
+    note_frame(seq, unix_ms());
+}
+
+/// A preview frame was made (the picture in the app's window: made only while it's watched).
+pub fn note_preview() {
+    if on() {
+        PREVIEWS_NOW.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The timing in use (Source → Timing, the 4K picture): written as a `settings` event when it changes,
+/// and when the log starts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Settings {
+    pub capture_fps: u32,
+    pub preview_fps: u32,
+    pub picture_4k: bool,
+    pub interval_ms: u64,
+    pub stable_ms: u64,
+    pub clear_after_ms: u64,
+    /// the player's own timing (else the game's, from its layout)
+    pub custom: bool,
+}
+
+static SETTINGS: Mutex<Option<Settings>> = Mutex::new(None);
+
+pub fn note_settings(s: Settings) {
+    if !on() {
+        return;
+    }
+    {
+        let mut last = SETTINGS.lock().unwrap();
+        if *last == Some(s) {
+            return;
+        }
+        *last = Some(s);
+    }
+    emit(
+        "settings",
+        json!({
+            "capture_fps": s.capture_fps, "preview_fps": s.preview_fps, "picture_4k": s.picture_4k, "interval_ms": s.interval_ms,
+            "stable_ms": s.stable_ms, "clear_after_ms": s.clear_after_ms, "timing_custom": s.custom,
+        }),
+    );
+}
+
 /// When each recent frame was captured (its number, Unix ms): a line's first sighting is measured from
 /// when its frame was taken, not from when it was read.
 static FRAMES: Mutex<VecDeque<(u64, u64)>> = Mutex::new(VecDeque::new());
@@ -196,8 +254,12 @@ pub fn captured_of(seq: u64) -> Option<u64> {
 
 // ------------------------------------------------------------------------------------- readings
 
-/// Frames captured since the last per-second readings (their `fps`).
+/// Frames captured since the last per-second readings (their `fps`), preview frames made (`preview_fps`),
+/// and the last full frame's size.
 static FRAMES_NOW: AtomicU32 = AtomicU32::new(0);
+static PREVIEWS_NOW: AtomicU32 = AtomicU32::new(0);
+static FRAME_W: AtomicU32 = AtomicU32::new(0);
+static FRAME_H: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Default)]
 struct Reads {
@@ -224,6 +286,7 @@ fn with_reads(f: impl FnOnce(&mut Reads)) {
         let since = *r.since.get_or_insert_with(|| {
             r.cpu = super::cpu::now();
             FRAMES_NOW.store(0, Ordering::Relaxed);
+            PREVIEWS_NOW.store(0, Ordering::Relaxed);
             now
         });
         f(r);
@@ -235,6 +298,8 @@ fn with_reads(f: impl FnOnce(&mut Reads)) {
         let cpu_now = super::cpu::now();
         let shares = r.cpu.as_ref().zip(cpu_now.as_ref()).and_then(|(a, b)| super::cpu::share(a, b));
         let fps = round1(f64::from(FRAMES_NOW.swap(0, Ordering::Relaxed)) / span.as_secs_f64());
+        let preview_fps = round1(f64::from(PREVIEWS_NOW.swap(0, Ordering::Relaxed)) / span.as_secs_f64());
+        let (fw, fh) = (FRAME_W.load(Ordering::Relaxed), FRAME_H.load(Ordering::Relaxed));
         let areas: serde_json::Map<String, Value> = r
             .areas
             .iter()
@@ -244,7 +309,8 @@ fn with_reads(f: impl FnOnce(&mut Reads)) {
             "n": r.n, "ocr_avg": round1(r.total / f64::from(r.n.max(1))), "ocr_max": round1(r.max),
             "pass_n": r.passes, "pass_avg": round1(r.pass_total / f64::from(r.passes.max(1))), "pass_max": round1(r.pass_max),
             "areas": areas, "suppressed": r.suppressed,
-            "cpu_app": shares.map(|s| s.0), "cpu_all": shares.map(|s| s.1), "fps": fps,
+            "cpu_app": shares.map(|s| s.0), "cpu_all": shares.map(|s| s.1), "fps": fps, "preview_fps": preview_fps,
+            "frame_w": (fw > 0).then_some(fw), "frame_h": (fh > 0).then_some(fh),
         });
         *r = Reads { since: Some(now), cpu: cpu_now, ..Reads::default() };
         ev
@@ -379,6 +445,41 @@ mod tests {
         emit("seen", json!({ "area": "subtitles" }));
         note_frame(7, 1);
         assert_eq!(captured_of(7), None, "nothing kept while off");
+    }
+
+    #[test]
+    fn fork_linelog_tells_the_settings_once_and_again_when_they_change() {
+        let base = Settings { capture_fps: 12, preview_fps: 60, picture_4k: true, interval_ms: 16, stable_ms: 0, clear_after_ms: 70, custom: false };
+        let (_, v) = collect(|| {
+            note_settings(base);
+            note_settings(base);
+            note_settings(Settings { interval_ms: 100, custom: true, ..base });
+        });
+        let s: Vec<&Value> = v.iter().filter(|e| e["ev"] == "settings").collect();
+        assert_eq!(s.len(), 2, "{v:?}");
+        assert_eq!((s[0]["picture_4k"].as_bool(), s[0]["clear_after_ms"].as_u64()), (Some(true), Some(70)));
+        assert_eq!((s[1]["interval_ms"].as_u64(), s[1]["timing_custom"].as_bool()), (Some(100), Some(true)));
+        // a log started again says them again
+        let (_, v) = collect(|| note_settings(base));
+        assert_eq!(v.iter().filter(|e| e["ev"] == "settings").count(), 1);
+    }
+
+    #[test]
+    fn fork_linelog_counts_preview_frames_and_keeps_the_frame_size() {
+        let (_, v) = collect(|| {
+            // (the second's readings start with the first reading)
+            read_sample("subtitles", 30.0);
+            note_captured(1, 2560, 1600);
+            for _ in 0..5 {
+                note_preview();
+            }
+            std::thread::sleep(Duration::from_millis(1050));
+            read_sample("subtitles", 30.0);
+        });
+        let r = v.iter().find(|e| e["ev"] == "reads").expect("a second's readings");
+        assert_eq!((r["frame_w"].as_u64(), r["frame_h"].as_u64()), (Some(2560), Some(1600)));
+        assert!(r["preview_fps"].as_f64().is_some_and(|p| p > 0.0 && p <= 5.0), "{r}");
+        assert!(r["fps"].as_f64().is_some_and(|p| p > 0.0), "{r}");
     }
 
     #[test]
