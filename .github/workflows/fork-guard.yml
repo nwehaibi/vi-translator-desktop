@@ -70,6 +70,12 @@ jobs:
           set -e
           if [ "$code" -ge 2 ]; then echo "::error::the lines the memory has, the counts or the memory file differ"; exit 1; fi
 
+      # (the upstream sync's merge, as the weekly workflow runs it, against made-up updates of the original:
+      # merged with the base moved on and the guard passing, a conflict reported, a workflow change waiting
+      # for its token, a timing default flagged; local copies only)
+      - name: The upstream sync merges as it should
+        run: bash .fork/tests/sync-dry-run.sh
+
       # (the measurement tools in the window of a release build — the original shows its Debugging section
       # in development builds only: the real window in Chromium, the app's commands answered by a stand-in,
       # a release and a development build, English and Arabic)

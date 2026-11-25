@@ -24,7 +24,7 @@ on:
         default: true
   push:
     branches: ["claude/**"]
-    paths-ignore: ["**.md", "NOTICE", "LICENSE"]
+    paths-ignore: ["**.md", "NOTICE", "LICENSE", ".fork/tests/**"]
 
 permissions:
   contents: read
