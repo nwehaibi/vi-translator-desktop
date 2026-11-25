@@ -1,12 +1,18 @@
 // fork: the Xbox fork's additions to the app's window (see FORK.md), kept out of app.js and the app's
 // dictionaries so the original app's updates merge without conflicts:
 // - its own words in Arabic (looked up before the app's: the app's dictionaries stay as they are);
-// - Debugging: the measurement log's switch (fork-settings.json; off by default);
+// - Show on → "Measurement (this copy)": the measurement log's switch (fork-settings.json; off by
+//   default), a section of its own after the app's Debugging. Not inside it: the original shows
+//   Debugging in development builds only (app.js: dev_build), and this copy's builds are release ones;
 // - the update banner: updates of the original app are only announced in this copy (installing one
 //   would replace this build and its Xbox support), with a link to the new version's page.
 (() => {
   const WORDS = {
     ar: {
+      "Measurement (this copy)": "القياس (هذه النسخة)",
+      "This copy's (Xbox) tools to measure how the app reads, translates and shows each line, and what that costs the PC. They change nothing the app reads or shows.":
+        "أدوات هذه النسخة (Xbox) لقياس قراءة التطبيق لكل سطر وترجمته وعرضه، وما يكلّفه ذلك الجهاز. لا تغيّر شيئًا مما يقرؤه التطبيق أو يعرضه.",
+      "The measurement tools could not be loaded: {e}": "تعذّر تحميل أدوات القياس: {e}",
       "Measurement log (lines.log)": "سجل القياس (lines.log)",
       "Records what happens to each line read — first seen, sent to the translator, translated (and from where), shown, hidden, sent to and drawn on a TV — and why a line was lost. For measurements only: it changes nothing the app reads or shows. Off by default.":
         "يسجّل ما يجري لكل سطر مقروء — أول ظهور، والإرسال إلى المترجم، والترجمة (ومصدرها)، والعرض، والإخفاء، والإرسال إلى التلفاز ورسمه عليه — وسبب فقد أي سطر. للقياس فقط: لا يغيّر شيئًا مما يقرؤه التطبيق أو يعرضه. مطفأ افتراضيًا.",
@@ -41,40 +47,64 @@
     return settings;
   };
 
-  // ---- Debugging: the measurement log's switch, added under the app's own (it redraws its form: added again)
-  async function addLogSwitch(form) {
-    if (form.querySelector("#fork-log")) return;
-    const s = await load();
-    if (!s || form.querySelector("#fork-log")) return;
-    const box = document.createElement("div");
-    box.id = "fork-log-box";
-    box.innerHTML = `
-      <label class="check" style="color:var(--text);font-weight:600"><input type="checkbox" id="fork-log" ${s.line_log ? "checked" : ""}/> ${esc(t("Measurement log (lines.log)"))}</label>
-      <div class="muted small" style="margin:-6px 0 0">${esc(t("Records what happens to each line read — first seen, sent to the translator, translated (and from where), shown, hidden, sent to and drawn on a TV — and why a line was lost. For measurements only: it changes nothing the app reads or shows. Off by default."))}</div>
-      <div class="field"><label>${esc(t("Log size (MB; the file and one older copy are kept)"))}</label><div class="inline">
-        <input type="number" id="fork-log-mb" min="1" max="64" step="1" value="${Number(s.line_log_mb) || 1}" style="width:6em" /></div></div>
-      <button class="btn" id="fork-log-open">${esc(t("Open the log's folder"))}</button>`;
-    form.appendChild(box);
+  // ---- Show on → "Measurement (this copy)": a section of the fork's own, right after the app's Debugging
+  // (in every build: Debugging is the original's and shows in development builds only), drawn again in the
+  // window's language once the app has set it (it does after starting; a new language reloads the page)
+  function measureSection() {
+    let sec = document.getElementById("fork-measure");
+    if (sec) return sec;
+    sec = document.createElement("div");
+    sec.id = "fork-measure";
+    const debug = document.getElementById("debug-section");
+    if (debug && debug.parentElement) debug.after(sec);
+    else (document.getElementById("tab-show") || document.body).appendChild(sec);
+    return sec;
+  }
+  let drawn = 0;
+  async function drawMeasure() {
+    const turn = ++drawn;
+    const sec = measureSection();
+    let s = settings,
+      failed = null;
+    if (!s) {
+      try {
+        s = settings = await invoke("fork_settings_get");
+      } catch (e) {
+        failed = e;
+      }
+    }
+    if (turn !== drawn) return; // (drawn again meanwhile)
+    const head = `<h3>${esc(t("Measurement (this copy)"))}</h3>
+      <p class="muted small">${esc(t("This copy's (Xbox) tools to measure how the app reads, translates and shows each line, and what that costs the PC. They change nothing the app reads or shows."))}</p>`;
+    if (!s) {
+      sec.innerHTML = `${head}<div class="callout">${esc(t("The measurement tools could not be loaded: {e}", { e: failed }))}</div>`;
+      return;
+    }
+    sec.innerHTML = `${head}
+      <div class="form" id="fork-measure-form">
+        <label class="check" style="color:var(--text);font-weight:600"><input type="checkbox" id="fork-log" ${s.line_log ? "checked" : ""}/> ${esc(t("Measurement log (lines.log)"))}</label>
+        <div class="muted small" style="margin:-6px 0 0">${esc(t("Records what happens to each line read — first seen, sent to the translator, translated (and from where), shown, hidden, sent to and drawn on a TV — and why a line was lost. For measurements only: it changes nothing the app reads or shows. Off by default."))}</div>
+        <div class="field"><label>${esc(t("Log size (MB; the file and one older copy are kept)"))}</label><div class="inline">
+          <input type="number" id="fork-log-mb" min="1" max="64" step="1" value="${Number(s.line_log_mb) || 1}" style="width:6em" /></div></div>
+        <button class="btn" id="fork-log-open">${esc(t("Open the log's folder"))}</button>
+      </div>`;
     const save = async (change) => {
       try {
         settings = await invoke("fork_settings_set", { value: { ...settings, ...change } });
       } catch (e) {
         alert(t("The fork's settings could not be saved: {e}", { e }));
       }
-      const cb = box.querySelector("#fork-log");
+      const cb = sec.querySelector("#fork-log");
       if (cb && settings) cb.checked = !!settings.line_log;
-      const mb = box.querySelector("#fork-log-mb");
+      const mb = sec.querySelector("#fork-log-mb");
       if (mb && settings) mb.value = settings.line_log_mb;
     };
-    box.querySelector("#fork-log").addEventListener("change", (e) => save({ line_log: e.target.checked }));
-    box.querySelector("#fork-log-mb").addEventListener("change", (e) => save({ line_log_mb: Math.min(Math.max(Math.round(Number(e.target.value) || 1), 1), 64) }));
-    box.querySelector("#fork-log-open").addEventListener("click", () => invoke("fork_open_log_folder").catch(() => {}));
+    sec.querySelector("#fork-log").addEventListener("change", (e) => save({ line_log: e.target.checked }));
+    sec.querySelector("#fork-log-mb").addEventListener("change", (e) => save({ line_log_mb: Math.min(Math.max(Math.round(Number(e.target.value) || 1), 1), 64) }));
+    sec.querySelector("#fork-log-open").addEventListener("click", () => invoke("fork_open_log_folder").catch(() => {}));
   }
-  const form = document.getElementById("debug-form");
-  if (form) {
-    new MutationObserver(() => addLogSwitch(form)).observe(form, { childList: true });
-    addLogSwitch(form);
-  }
+  drawMeasure();
+  new MutationObserver(() => drawMeasure()).observe(document.documentElement, { attributes: true, attributeFilter: ["lang"] });
 
   // ---- the update banner: an original version is only announced
   const bar = document.getElementById("update-bar");

@@ -69,3 +69,14 @@ jobs:
           code=$?
           set -e
           if [ "$code" -ge 2 ]; then echo "::error::the lines the memory has, the counts or the memory file differ"; exit 1; fi
+
+      # (the measurement tools in the window of a release build — the original shows its Debugging section
+      # in development builds only: the real window in Chromium, the app's commands answered by a stand-in,
+      # a release and a development build, English and Arabic)
+      - name: The measurement tools are in the window of a release build
+        run: |
+          set -euo pipefail
+          cargo run -q -p vi-translator-core --example fork_window_fixture > "$RUNNER_TEMP/window-fixture.json"
+          mkdir -p "$RUNNER_TEMP/pw"
+          (cd "$RUNNER_TEMP/pw" && npm init -y > /dev/null && npm install --no-audit --no-fund --silent playwright@1.63.0 && npx playwright install --with-deps chromium > /dev/null)
+          NODE_PATH="$RUNNER_TEMP/pw/node_modules" node .fork/tests/ui-release.cjs "$RUNNER_TEMP/window-fixture.json"
