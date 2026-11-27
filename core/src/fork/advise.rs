@@ -192,7 +192,9 @@ struct Line {
     ended_how: Option<String>,
     gone: Option<(f64, f64)>,
     absent_text_px: u64,
-    gaps: Vec<(f64, u64, u64)>,
+    /// The blinks the line stayed up over: (ms from its last pass read to its last pass not read, passes,
+    /// passes the finder saw text in, passes other text was read in)
+    gaps: Vec<(f64, u64, u64, u64)>,
     tv_on: Option<f64>,
     tv_off: Option<f64>,
     skipped: bool,
@@ -292,7 +294,7 @@ fn lines_of(ev: &[Value], frame_ms: f64) -> Vec<Line> {
             }
             "gap" => {
                 if let (Some(a), Some(b)) = (f(e, "last_present"), f(e, "last_absent")) {
-                    l.gaps.push((b - a, u(e, "frames").unwrap_or(0), u(e, "text_px").unwrap_or(0)));
+                    l.gaps.push((b - a, u(e, "frames").unwrap_or(0), u(e, "text_px").unwrap_or(0), u(e, "other").unwrap_or(0)));
                 }
             }
             _ => {}
@@ -324,13 +326,34 @@ fn lines_of(ev: &[Value], frame_ms: f64) -> Vec<Line> {
             }
         }
     }
-    // the TV: the first state sent with the line (its `at`) and the first without it after it came down
-    let mut drawn: HashMap<(String, String), f64> = HashMap::new();
+    // the TV: the first state sent with the line (its `at`) and the first without it after it came down. A
+    // state's version is a print of what it holds, so the same state (nothing up, most of all) comes back
+    // again and again: each drawing goes with the sending it answers — its `sent`, the sending's own time —
+    // or, in a log without it, with the first drawing of that version after the sending.
+    let mut drawn_exact: HashMap<(String, String, u64), f64> = HashMap::new();
+    let mut drawn_at: HashMap<(String, String), Vec<f64>> = HashMap::new();
     for e in ev.iter().filter(|e| kind(e) == "tv_drawn") {
         if let Some(est) = f(e, "est") {
-            drawn.entry((s(e, "tv").to_string(), s(e, "version").to_string())).or_insert(est);
+            let key = (s(e, "tv").to_string(), s(e, "version").to_string());
+            if let Some(sent) = u(e, "sent") {
+                drawn_exact.entry((key.0.clone(), key.1.clone(), sent)).or_insert(est);
+            }
+            drawn_at.entry(key).or_default().push(est);
         }
     }
+    for v in drawn_at.values_mut() {
+        v.sort_by(|a, b| a.total_cmp(b));
+    }
+    let drawn_for = |e: &Value| -> Option<f64> {
+        let (tv, version, sent) = (s(e, "tv").to_string(), s(e, "version").to_string(), t(e));
+        if let Some(est) = drawn_exact.get(&(tv.clone(), version.clone(), sent)) {
+            return Some(*est);
+        }
+        // (an older log: the first drawing of this version from the sending on, within 10 s)
+        let v = drawn_at.get(&(tv, version))?;
+        let i = v.partition_point(|&x| x < sent as f64 - 20.0);
+        v.get(i).copied().filter(|&x| x <= sent as f64 + 10_000.0)
+    };
     let tvs: Vec<&Value> = ev.iter().filter(|e| kind(e) == "tv_sent").collect();
     let tv_ts: Vec<u64> = tvs.iter().map(|e| t(e)).collect();
     for l in lines.iter_mut() {
@@ -338,7 +361,7 @@ fn lines_of(ev: &[Value], frame_ms: f64) -> Vec<Line> {
         let from = tv_ts.partition_point(|&x| x + 5 < st);
         for e in tvs[from..].iter().take(200) {
             if e["shown"][&l.area].as_u64() == Some(l.at) {
-                l.tv_on = drawn.get(&(s(e, "tv").to_string(), s(e, "version").to_string())).copied();
+                l.tv_on = drawn_for(e);
                 break;
             }
         }
@@ -346,7 +369,7 @@ fn lines_of(ev: &[Value], frame_ms: f64) -> Vec<Line> {
             let from = tv_ts.partition_point(|&x| x + 5 < dt);
             for e in tvs[from..].iter().take(200) {
                 if e["shown"][&l.area].as_u64() != Some(l.at) {
-                    l.tv_off = drawn.get(&(s(e, "tv").to_string(), s(e, "version").to_string())).copied();
+                    l.tv_off = drawn_for(e);
                     break;
                 }
             }
@@ -391,15 +414,16 @@ fn seconds_of(ev: &[Value]) -> Seconds {
             x.preview_on += 1;
             x.preview_ms.extend(f(e, "preview_ms"));
         } else {
-            // (the CPU without the preview's share: the play as it's meant to be)
+            // (the CPU without the preview's share: the play as it's meant to be; and a full frame's own cost —
+            // with the preview on, a frame taken for both counts the preview's shrinking in it too)
             x.cpu_app.extend(f(e, "cpu_app"));
             x.cpu_all.extend(f(e, "cpu_all"));
+            x.copy_ms.extend(f(e, "copy_ms"));
         }
         x.fps.extend(f(e, "fps"));
         x.stream_fps.extend(f(e, "stream_fps").filter(|v| *v > 0.0));
         x.passes.extend(f(e, "pass_n"));
         x.pass.extend(f(e, "pass_avg").filter(|_| u(e, "pass_n").unwrap_or(0) > 0));
-        x.copy_ms.extend(f(e, "copy_ms"));
         x.age_ms.extend(f(e, "age_ms"));
         x.idle_ms.extend(f(e, "idle_ms"));
         x.same_frame += f(e, "same_frame").unwrap_or(0.0);
@@ -488,6 +512,10 @@ fn analyze_segment(ev: &[Value], timing: Timing, cpus: Option<f64>, o: &Options)
     let mut examples: Vec<Value> = Vec::new();
     let clears: Vec<u64> = ev.iter().filter(|e| kind(e) == "cleared").map(t).collect();
     let nbl: Vec<u64> = ev.iter().filter(|e| kind(e) == "filtered" && s(e, "area") == "subtitles" && s(e, "reason") == "no_bottom_line").map(t).collect();
+    // (the Arabic down and up again within 40 ms: no gap anyone sees — the presenter's tick, a TV state
+    // or two — the line replaced by another reading of it; a change seen if its Arabic differs)
+    let mut instant_swaps = 0usize;
+    let mut instant_same = 0usize;
     for w in shown.windows(2) {
         let (a, b) = (w[0], w[1]);
         let (Some(down), Some(up)) = (a.down_t, b.shown_t) else { continue };
@@ -495,6 +523,14 @@ fn analyze_segment(ev: &[Value], timing: Timing, cpus: Option<f64>, o: &Options)
             continue;
         }
         if up < down || up - down > 1500 || similarity(&a.en, &b.en) < 0.9 {
+            continue;
+        }
+        if up - down < 40 {
+            if a.ar.is_empty() || b.ar.is_empty() || a.ar != b.ar {
+                instant_swaps += 1;
+            } else {
+                instant_same += 1;
+            }
             continue;
         }
         // (how long the English wasn't read: from the last frame it was read in to the frame before it was
@@ -524,7 +560,8 @@ fn analyze_segment(ev: &[Value], timing: Timing, cpus: Option<f64>, o: &Options)
             continue;
         };
         *flicker.entry(cause).or_default() += 1;
-        if let Some(sp) = span {
+        // (a page's clearing takes everything down whatever Clear after: not a span of the model)
+        if let Some(sp) = span.filter(|_| cause != "page") {
             spans.push(sp);
             if cause == "ocr_miss" {
                 ocr_miss_spans.push(sp);
@@ -538,12 +575,20 @@ fn analyze_segment(ev: &[Value], timing: Timing, cpus: Option<f64>, o: &Options)
     let variant_swaps = shown
         .windows(2)
         .filter(|w| w[0].down_how == "replaced" && w[1].shown_t.zip(w[0].shown_t).is_some_and(|(b, a)| b - a < 600) && similarity(&w[0].en, &w[1].en) >= 0.7 && norm(&w[0].en) != norm(&w[1].en))
-        .count();
-    // the OCR blinks the line stayed up over (v2): how long, and the text still there or not
-    let gaps: Vec<&(f64, u64, u64)> = subs.iter().flat_map(|l| l.gaps.iter()).collect();
-    spans.extend(gaps.iter().map(|g| g.0));
+        .count()
+        + instant_swaps;
+    // the OCR blinks the line stayed up over (v2): how long, and the text still there or not. Only a pass
+    // nothing was read in can take the Arabic down (one that read other text — a misreading of the line —
+    // counts as the area seen): a blink of other readings only is no span of the model, a mixed one only
+    // its passes of nothing (at most: they may not all run on)
+    let gaps: Vec<&(f64, u64, u64, u64)> = subs.iter().flat_map(|l| l.gaps.iter()).collect();
+    let empty_span = |g: &(f64, u64, u64, u64)| (g.3 < g.1).then(|| if g.3 == 0 { g.0 } else { g.0 * (g.1 - g.3) as f64 / g.1 as f64 });
+    let misread_blinks = gaps.iter().filter(|g| g.3 >= g.1 && g.1 > 0).count();
+    spans.extend(gaps.iter().filter_map(|g| empty_span(g)));
     // (the blinks over text still on screen: the ones that hid the line, and the ones it stayed up over)
-    ocr_miss_spans.extend(gaps.iter().filter(|g| g.2 > 0).map(|g| g.0));
+    ocr_miss_spans.extend(gaps.iter().filter(|g| g.2 > 0).filter_map(|g| empty_span(g)));
+    // the model's own check: at the value in use it must say the flickers that happened (but a page's)
+    let flickers_seen = flicker.iter().filter(|(c, _)| **c != "page").map(|(_, n)| *n).sum::<u64>();
 
     // ---- lines lost, and why
     let unread: Vec<&Value> = ev.iter().filter(|e| kind(e) == "unread" && s(e, "area") == "subtitles").collect();
@@ -744,7 +789,17 @@ fn analyze_segment(ev: &[Value], timing: Timing, cpus: Option<f64>, o: &Options)
     recs.push(stability_advice(&seen, ev, timing, read_ms, o));
 
     // 5. Clear after: the Arabic goes this long after its English was last read
-    recs.push(clear_after_advice(&spans, &ocr_miss_spans, &gone, &end_tv, &end_pc, shown.len(), minutes, timing, read_ms, o));
+    recs.push(clear_after_advice(
+        Blinks { spans: &spans, ocr_miss: &ocr_miss_spans, flickers_seen, misread_only: misread_blinks },
+        &gone,
+        &end_tv,
+        &end_pc,
+        shown.len(),
+        minutes,
+        timing,
+        read_ms,
+        o,
+    ));
 
     json!({
         "minutes": r1(minutes),
@@ -755,7 +810,7 @@ fn analyze_segment(ev: &[Value], timing: Timing, cpus: Option<f64>, o: &Options)
             "start_on_tv_ms": spread(&start_tv), "start_here_ms": spread(&start_pc), "start_breakdown_ms": breakdown,
             "end_on_tv_ms": spread(&end_tv), "end_here_ms": spread(&end_pc), "english_appear_bracket_ms": spread(&bracket),
         },
-        "flicker": { "by_cause": flicker, "a_minute": (minutes > 0.0).then(|| r1(flicker.values().sum::<u64>() as f64 / minutes)), "variant_swaps": variant_swaps, "examples": examples },
+        "flicker": { "by_cause": flicker, "a_minute": (minutes > 0.0).then(|| r1(flicker.values().sum::<u64>() as f64 / minutes)), "variant_swaps": variant_swaps, "instant_same_arabic": instant_same, "examples": examples },
         "lost": lost,
         "misread": misread,
         "detector": detector,
@@ -849,18 +904,30 @@ fn stability_advice(seen: &[&Value], ev: &[Value], timing: Timing, read_ms: f64,
     )
 }
 
+/// What Clear after's model is given: the blinks that can take the Arabic down (`spans`, ms; those over text
+/// still on screen in `ocr_miss`), the flickers seen that it should account for, and the blinks of other
+/// readings only (no part of it).
+struct Blinks<'a> {
+    spans: &'a [f64],
+    ocr_miss: &'a [f64],
+    flickers_seen: u64,
+    misread_only: usize,
+}
+
 #[allow(clippy::too_many_arguments)]
-fn clear_after_advice(spans: &[f64], ocr_miss: &[f64], gone: &[&&Line], end_tv: &[f64], end_pc: &[f64], shown: usize, minutes: f64, timing: Timing, read_ms: f64, o: &Options) -> Value {
+fn clear_after_advice(b: Blinks, gone: &[&&Line], end_tv: &[f64], end_pc: &[f64], shown: usize, minutes: f64, timing: Timing, read_ms: f64, o: &Options) -> Value {
+    let (spans, ocr_miss) = (b.spans, b.ocr_miss);
     let ends = if end_tv.len() >= end_pc.len() { end_tv } else { end_pc };
-    if spans.len() < 5 || ends.len() < 20 {
+    // (no blinks at all is an answer too — nothing to keep the Arabic up over — given lines enough to tell)
+    if ends.len() < 20 || shown < 30 {
         return advice(
             "clear_after_ms",
             timing.clear_after_ms,
             None,
             "insufficient",
-            format!("البيانات غير كافية: {} انقطاع قراءة قصير و{} نهاية سطر مقيسة (الحد الأدنى 5 و20، ويحتاجان سجل الإصدار 2).", spans.len(), ends.len()),
+            format!("البيانات غير كافية: {shown} سطرًا معروضًا و{} نهاية سطر مقيسة (الحد الأدنى 30 و20، ونهايات الأسطر تحتاج سجل الإصدار 2).", ends.len()),
             String::new(),
-            json!({ "blinks": spans.len(), "ends": ends.len() }),
+            json!({ "blinks": spans.len(), "ends": ends.len(), "lines_shown": shown }),
             "جلسة لعب 15 دقيقة بالسجل الإصدار 2.".into(),
         );
     }
@@ -906,13 +973,17 @@ fn clear_after_advice(spans: &[f64], ocr_miss: &[f64], gone: &[&&Line], end_tv: 
     let (now, rec) = (row(cur), row(v));
     let p95_miss = quant(ocr_miss, 0.95);
     let (lo, hi) = (step(v) * r, (step(v) + 1.0) * r);
+    // the model's own check: the flickers it says for the value in use against those that happened
+    let said_now = now["flickers"].as_f64().unwrap_or(0.0);
+    let holds = (said_now - b.flickers_seen as f64).abs() <= 2.0_f64.max(0.3 * b.flickers_seen as f64);
+    let confidence = if !holds { "low" } else if ends.len() >= 30 && minutes >= 10.0 { "high" } else { "medium" };
     advice(
         "clear_after_ms",
         cur,
         Some(v),
-        if spans.len() >= 10 && ends.len() >= 30 { "high" } else { "medium" },
+        confidence,
         format!(
-            "القراءة تجري كل {r:.0} مللي ثانية، ولا يحكم التطبيق باختفاء النص إلا عند قراءة، فهذا الإعداد يعمل بخطوات من {r:.0}: كل القيم من {lo:.0} إلى أقل من {hi:.0} متكافئة، {}. خلال الجلسة انقطعت قراءة سطر ظاهر {} مرة، منها {} والنص ما زال على الشاشة (خطأ قراءة). القيمة {v} أقل كلفة وفق المعيار: الوميض مقابل بقاء العربية بعد الإنجليزية (الوميض الواحد يُحسب بـ {:.1} ثانية من البقاء). هذه القيمة لمعدل الالتقاط الحالي: إن تغيّر Capture FPS تتغير الخطوة.",
+            "القراءة تجري كل {r:.0} مللي ثانية، ولا يحكم التطبيق باختفاء النص إلا عند قراءة، فهذا الإعداد يعمل بخطوات من {r:.0}: كل القيم من {lo:.0} إلى أقل من {hi:.0} متكافئة، {}. خلال الجلسة غاب السطر الظاهر عن القراءة {} مرة دون أن يُقرأ مكانه شيء، منها {} والنص ما زال على الشاشة (خطأ قراءة){}. القيمة {v} أقل كلفة وفق المعيار: الوميض مقابل بقاء العربية بعد الإنجليزية (الوميض الواحد يُحسب بـ {:.1} ثانية من البقاء). {} هذه القيمة لمعدل الالتقاط الحالي: إن تغيّر Capture FPS تتغير الخطوة.",
             if step(v) < 1.0 {
                 "تُخفي العربية عند أول قراءة لا يُرى فيها النص، فأي انقطاع قراءة يسبب وميضًا".to_string()
             } else {
@@ -920,13 +991,19 @@ fn clear_after_advice(spans: &[f64], ocr_miss: &[f64], gone: &[&&Line], end_tv: 
             },
             spans.len(),
             ocr_miss.len(),
-            o.flicker_ms / 1000.0
+            if b.misread_only > 0 { format!("؛ و{} مرة قُرئ فيها نص آخر مكانه (قراءة خاطئة)، وهذه لا تُخفي العربية أيًّا كانت القيمة", b.misread_only) } else { String::new() },
+            o.flicker_ms / 1000.0,
+            if holds {
+                format!("فحص النموذج: يقول بالقيمة الحالية {said_now:.0} ومضة، والمرصود {}.", b.flickers_seen)
+            } else {
+                format!("تنبيه: النموذج يقول بالقيمة الحالية {said_now:.0} ومضة والمرصود {}، فالتوصية ضعيفة حتى يُعرف السبب.", b.flickers_seen)
+            }
         ),
         format!(
             "الوميض: {} ← {} في الدقيقة. تأخر اختفاء العربية عن الإنجليزية (p50): {} ← {} مللي ثانية.",
             now["flickers_a_minute"], rec["flickers_a_minute"], now["end_lag_p50_ms"], rec["end_lag_p50_ms"]
         ),
-        json!({ "blinks": spans.len(), "blinks_text_still_there": ocr_miss.len(), "blink_p95_text_still_there_ms": p95_miss, "ends": ends.len(), "lines_shown": shown, "gone_lines": gone.len(), "pass_ms": r1(r), "table": table }),
+        json!({ "blinks": spans.len(), "blinks_text_still_there": ocr_miss.len(), "blinks_misread_only": b.misread_only, "flickers_seen": b.flickers_seen, "flickers_said_now": said_now, "model_holds": holds, "blink_p95_text_still_there_ms": p95_miss, "ends": ends.len(), "lines_shown": shown, "gone_lines": gone.len(), "pass_ms": r1(r), "table": table }),
         "جلسة لعب بالقيمة المقترحة، ثم أقارن الوميض وتأخر الاختفاء. والحكم الأخير لعينك على التلفزيون.".into(),
     )
 }
@@ -1286,6 +1363,95 @@ mod tests {
     }
     fn row<'a>(a: &'a Value, key: &str, v: f64) -> &'a Value {
         a["evidence"]["table"].as_array().unwrap().iter().find(|r| r[key].as_f64() == Some(v)).unwrap_or_else(|| panic!("no {key} {v}: {a}"))
+    }
+
+    #[test]
+    fn fork_advise_links_each_tv_drawing_to_its_own_sending() {
+        // as the TV's states are versioned: a print of what they hold, so the empty one comes back each time
+        // a line goes; each drawing tells the sending it answers (`sent`)
+        let mut ev = session(40, 0, 0, 70);
+        let sent_of: HashMap<String, u64> = ev.iter().filter(|e| kind(e) == "tv_sent").map(|e| (s(e, "version").to_string(), t(e))).collect();
+        let empty: std::collections::HashSet<String> = ev.iter().filter(|e| kind(e) == "tv_sent" && e["shown"].as_object().is_some_and(|m| m.is_empty())).map(|e| s(e, "version").to_string()).collect();
+        for e in ev.iter_mut() {
+            let v = s(e, "version").to_string();
+            if kind(e) == "tv_drawn" {
+                e["sent"] = json!(sent_of[&v]);
+            }
+            if empty.contains(&v) {
+                e["version"] = json!("empty");
+            }
+        }
+        let r = analyze(&ev, &Options::default());
+        let sync = &r["segments"][0]["sync"];
+        // the same as with a version of its own each (fork_advise_measures_the_sync_of_a_made_up_session)
+        assert_eq!(sync["end_on_tv_ms"]["p50"].as_f64(), Some(250.0), "{sync}");
+        assert_eq!(sync["start_on_tv_ms"]["p50"].as_f64(), Some(190.0), "{sync}");
+        // and a log without `sent`: the first drawing of the version from its sending on
+        for e in ev.iter_mut() {
+            if let Some(m) = e.as_object_mut() {
+                m.remove("sent");
+            }
+        }
+        let r = analyze(&ev, &Options::default());
+        assert_eq!(r["segments"][0]["sync"]["end_on_tv_ms"]["p50"].as_f64(), Some(250.0), "{}", r["segments"][0]["sync"]);
+    }
+
+    #[test]
+    fn fork_advise_clear_after_counts_only_blinks_that_can_take_the_arabic_down() {
+        // Clear after 150 on a 10-a-second capture: 1-pass blinks of nothing read (100 ms) stay up — what
+        // happened (no flicker) is what the model says, so it holds
+        let mut ev = session(40, 4, 1, 150);
+        // and ten blinks where other text was read (a misreading of the line): the area seen all along, no
+        // Clear after takes the Arabic down over them — no part of the model
+        let gaps: Vec<Value> = ev.iter().filter(|e| kind(e) == "gap").cloned().collect();
+        for g in gaps {
+            let mut m = g.clone();
+            m["t"] = json!(t(&g) + 1);
+            m["frames"] = json!(3);
+            m["other"] = json!(3);
+            m["last_absent"] = json!(u(&g, "last_present").unwrap() + 300);
+            ev.push(m);
+        }
+        ev.sort_by_key(t);
+        let r = analyze(&ev, &Options::default());
+        let ca = rec(&r, "clear_after_ms");
+        assert_eq!((ca["evidence"]["blinks"].as_u64(), ca["evidence"]["blinks_misread_only"].as_u64()), (Some(10), Some(10)), "{ca}");
+        assert_eq!(ca["evidence"]["model_holds"], true, "{ca}");
+        assert_ne!(ca["confidence"], "low", "{ca}");
+        // 1-pass blinks only: 150 is the best step's middle already
+        assert_eq!(ca["value"].as_f64(), Some(150.0), "{ca}");
+
+        // a log the model can't account for (100 ms blinks the line stayed up over at Clear after 70, where
+        // each should have taken it down): said, and the advice weak
+        let r = analyze(&session(40, 4, 1, 70), &Options::default());
+        let ca = rec(&r, "clear_after_ms");
+        assert_eq!((ca["evidence"]["model_holds"].as_bool(), ca["confidence"].as_str()), (Some(false), Some("low")), "{ca}");
+        assert!(ca["why"].as_str().unwrap().contains("تنبيه"), "{ca}");
+    }
+
+    #[test]
+    fn fork_advise_tells_a_line_replaced_at_once_from_a_flicker() {
+        // a line down and the same line up again 3 ms later (another reading of it taking its place): no
+        // gap anyone sees — a swap when its Arabic changes, nothing when it doesn't; 120 ms later: a flicker
+        let mut ev = session(40, 0, 0, 70);
+        let base = 1_800_000_000_000u64 + 400_000;
+        let mut seq = 500;
+        for (gap, ar2) in [(3u64, "سطر آخر"), (3, "سطر"), (120, "سطر")] {
+            let t0 = base + seq * 3000;
+            for (k, (en, ar)) in [("Jason: Hey.", "سطر"), ("Jason Hey", ar2)].into_iter().enumerate() {
+                let t = t0 + k as u64 * (1000 + gap);
+                seq += 1;
+                ev.push(json!({ "ev": "sent", "t": t - 2, "area": "subtitles", "seq": seq, "en": en, "at": t - 2 }));
+                ev.push(json!({ "ev": "shown", "t": t, "area": "subtitles", "seq": seq, "at": t - 2, "en": en, "ar": ar }));
+                ev.push(json!({ "ev": "hidden", "t": t + 1000, "area": "subtitles", "seq": seq }));
+                ev.push(json!({ "ev": "ended", "t": t + 1000, "area": "subtitles", "seq": seq, "how": "gone", "last_present": t + 900, "first_absent": t + 1000, "absent_text_px": 1 }));
+            }
+        }
+        ev.sort_by_key(t);
+        let r = analyze(&ev, &Options::default());
+        let f = &r["segments"][0]["flicker"];
+        assert_eq!(f["by_cause"]["ocr_miss"].as_u64(), Some(1), "{f}");
+        assert_eq!((f["variant_swaps"].as_u64(), f["instant_same_arabic"].as_u64()), (Some(1), Some(1)), "{f}");
     }
 
     #[test]

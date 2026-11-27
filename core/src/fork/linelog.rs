@@ -440,7 +440,8 @@ fn with_reads(f: impl FnOnce(&mut Reads)) {
         let cpu_now = super::cpu::now();
         let shares = r.cpu.as_ref().zip(cpu_now.as_ref()).and_then(|(a, b)| super::cpu::share(a, b));
         let fps = round1(f64::from(FRAMES_NOW.swap(0, Ordering::Relaxed)) / span.as_secs_f64());
-        let preview_fps = round1(f64::from(PREVIEWS_NOW.swap(0, Ordering::Relaxed)) / span.as_secs_f64());
+        let previews = PREVIEWS_NOW.swap(0, Ordering::Relaxed);
+        let preview_fps = round1(f64::from(previews) / span.as_secs_f64());
         let (fw, fh) = (FRAME_W.load(Ordering::Relaxed), FRAME_H.load(Ordering::Relaxed));
         let areas: serde_json::Map<String, Value> = r
             .areas
@@ -448,7 +449,7 @@ fn with_reads(f: impl FnOnce(&mut Reads)) {
             .map(|(a, (n, t))| (a.clone(), json!({ "n": n, "avg": round1(t / f64::from((*n).max(1))) })))
             .collect();
         let secs = span.as_secs_f64();
-        let previews = PREVIEWS_NOW.load(Ordering::Relaxed);
+        // (the previews counted above: read once — loaded again after it was set to 0, preview_ms was always empty)
         let (copy_us, copy_n) = (COPY_US.swap(0, Ordering::Relaxed), COPY_N.swap(0, Ordering::Relaxed));
         let preview_us = PREVIEW_US.swap(0, Ordering::Relaxed);
         let avg = |(n, t): (u32, f64)| (n > 0).then(|| round1(t / f64::from(n)));
@@ -721,6 +722,7 @@ mod tests {
             note_captured(1, 2560, 1600);
             for _ in 0..5 {
                 note_preview();
+                note_preview_cost(Duration::from_millis(4));
             }
             std::thread::sleep(Duration::from_millis(1050));
             read_sample("subtitles", 30.0);
@@ -728,6 +730,8 @@ mod tests {
         let r = v.iter().find(|e| e["ev"] == "reads").expect("a second's readings");
         assert_eq!((r["frame_w"].as_u64(), r["frame_h"].as_u64()), (Some(2560), Some(1600)));
         assert!(r["preview_fps"].as_f64().is_some_and(|p| p > 0.0 && p <= 5.0), "{r}");
+        // (a preview frame's cost: 4 ms each)
+        assert_eq!(r["preview_ms"].as_f64(), Some(4.0), "{r}");
         assert!(r["fps"].as_f64().is_some_and(|p| p > 0.0), "{r}");
     }
 
