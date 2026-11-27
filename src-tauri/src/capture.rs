@@ -251,7 +251,8 @@ impl Shared {
     }
     /// Store a ready-made preview JPEG (OBS sends one).
     pub fn put_preview_jpeg(&self, jpeg: Vec<u8>) {
-        vi_translator_core::fork::linelog::note_preview(); // fork: measurement log
+        // (fork: not counted as a preview frame here: each JPEG is made from a preview frame counted when it
+        // came in — counted twice in the log's first version, its preview_fps double the real rate)
         let seq = self.preview_seq.fetch_add(1, Ordering::Relaxed) + 1;
         *self.preview_jpeg.lock().unwrap() = Some((seq, Arc::new(jpeg)));
     }

@@ -568,7 +568,8 @@ fn present_loop(sink: Arc<dyn Sink>, rx: mpsc::Receiver<PMsg>, live: Arc<Live>) 
                         if crate::fork::linelog::on() {
                             let now = Instant::now();
                             let late = p.ended.get(&(area.clone(), seq)).is_some_and(|end| *end <= now);
-                            crate::fork::linelog::emit("shown", serde_json::json!({ "area": area, "seq": seq, "at": ev.at, "en": crate::fork::linelog::excerpt(&ev.en), "late": late }));
+                            let fork_ar: String = ev.segments.iter().map(|(t, c)| if c.as_deref().is_some_and(|c| c.starts_with("icon:")) { "🎮" } else { t.as_str() }).collect();
+                            crate::fork::linelog::emit("shown", serde_json::json!({ "area": area, "seq": seq, "at": ev.at, "en": crate::fork::linelog::excerpt(&ev.en), "late": late, "ar": crate::fork::linelog::excerpt(fork_ar.trim()) }));
                             fork_up.insert(area.clone(), (seq, now));
                         }
                         // (the text seen there is this line, or one before it: its translation is up now)
@@ -956,6 +957,7 @@ impl Reader {
             let _ = present.send(PMsg::ClearAll { upto: seq_counter });
             // fork: measurement log
             crate::fork::linelog::emit("cleared", serde_json::json!({ "upto": seq_counter, "reason": "language" }));
+            crate::fork::timeline::cleared("language");
         }
         // pause-menu text the translator failed on: asked again when it's read again (every 30 s at most)
         if menu_retry_at.elapsed() >= Duration::from_secs(30) {
@@ -1340,6 +1342,7 @@ impl Reader {
                         let _ = present.send(PMsg::ClearAll { upto: seq_counter });
                         // fork: measurement log
                         crate::fork::linelog::emit("cleared", serde_json::json!({ "upto": seq_counter, "reason": "page", "page": layout.id }));
+                        crate::fork::timeline::cleared("page");
                     }
                     if screen.as_ref() != Some(&layout) {
                         let reason_changed = screen.as_ref().map(|s| s.reason_en != layout.reason_en).unwrap_or(true);
@@ -1384,6 +1387,7 @@ impl Reader {
                     let pause = screen.is_some();
                     let pace = if pause { (1000 / c.capture_fps.clamp(1, 60) as u64).min(interval_ms) } else { interval_ms };
                     let spent = t0.elapsed();
+                    crate::fork::timeline::pass_end(Some(frame.as_ref())); // fork: measurement log
                     crate::fork::linelog::pass_sample(spent.as_secs_f64() * 1000.0); // fork: measurement log
                     // (normal areas pause while the page is up)
                     done!(Duration::from_millis(pace.max(30)).saturating_sub(spent));
@@ -1954,6 +1958,11 @@ impl Reader {
                     }
                     text.clear();
                 }
+                // fork: measurement log: this area's reading this pass (each line's timeline, the unread-text finder)
+                if fork_on {
+                    let fork_same = !text.is_empty() && same_text(&text, &lines_now, &st.current, &st.current_lines);
+                    crate::fork::timeline::area_read(&area.id, [area_cfg.x, area_cfg.y, area_cfg.w, area_cfg.h], area_cfg.centered_only, stacks, !text.is_empty(), fork_same, st.current_seq, frame.map(|f| f.seq));
+                }
                 if !text.is_empty() {
                     st.last_seen = Some(now);
                     // The line on screen read again; or other text read in its place for as long as it takes
@@ -2018,18 +2027,6 @@ impl Reader {
                         st.candidate_lines = lines_now.clone();
                         st.candidate_since = Some(now);
                         is_new = true;
-                        // fork: measurement log: a new reading of this area (a line's first sighting, or a change)
-                        if fork_on {
-                            let fseq = frame.map(|f| f.seq);
-                            crate::fork::linelog::emit(
-                                "seen",
-                                serde_json::json!({
-                                    "area": area.id, "text": crate::fork::linelog::excerpt(&st.candidate), "lines": st.candidate_lines.len(),
-                                    "frame": fseq, "captured": fseq.and_then(crate::fork::linelog::captured_of),
-                                    "ocr_ms": (fork_ocr_ms * 10.0).round() / 10.0, "sure": sure,
-                                }),
-                            );
-                        }
                     }
                     // A line the translation memory already knows needn't wait to settle: show it on
                     // first sight. Other lines wait `stable_ms` so a half-faded frame isn't translated.
@@ -2050,6 +2047,21 @@ impl Reader {
                                 parts.len() > 1 && parts.iter().all(|(p, _)| knows(p))
                             })
                         });
+                    // fork: measurement log: a new reading of this area (a line's first sighting, or a change), the
+                    // frame read before it (the English appeared between them) and the memory's verdict on it
+                    if fork_on && is_new {
+                        let fseq = frame.map(|f| f.seq);
+                        let (prev_captured, prev_text) = crate::fork::timeline::on_seen(&area.id);
+                        crate::fork::linelog::emit(
+                            "seen",
+                            serde_json::json!({
+                                "area": area.id, "text": crate::fork::linelog::excerpt(&st.candidate), "lines": st.candidate_lines.len(),
+                                "frame": fseq, "captured": fseq.and_then(crate::fork::linelog::captured_of),
+                                "ocr_ms": (fork_ocr_ms * 10.0).round() / 10.0, "sure": sure,
+                                "prev_captured": prev_captured, "prev_text": prev_text, "known": known,
+                            }),
+                        );
+                    }
                     // A reading the app isn't sure of (text still animating in: GTA VI's instructions
                     // fade in with a glow) waits three times as long: by then the real text has
                     // replaced it, or it really is what's on screen.
@@ -2228,6 +2240,7 @@ impl Reader {
                                     "parts": parts.iter().map(|(t, _)| crate::fork::linelog::excerpt(t)).collect::<Vec<_>>(),
                                     "at": crate::fork::linelog::at_ms(en_start), "frame": fseq,
                                     "captured": fseq.and_then(crate::fork::linelog::captured_of), "recolor": recolor,
+                                    "appear_after": crate::fork::timeline::appear(&area.id).0, "appear_by": crate::fork::timeline::appear(&area.id).1,
                                 }),
                             );
                         }
@@ -2264,6 +2277,7 @@ impl Reader {
         }
         let spent = t0.elapsed();
         perf_note(PerfKind::Read, spent.as_secs_f64() * 1000.0);
+        crate::fork::timeline::pass_end(frame.map(|f| f.as_ref())); // fork: measurement log
         crate::fork::linelog::pass_sample(spent.as_secs_f64() * 1000.0); // fork: measurement log
         done!(Duration::from_millis(interval_ms.max(MIN_INTERVAL_MS)).saturating_sub(spent));
     }

@@ -13,10 +13,10 @@
       "This copy's (Xbox) tools to measure how the app reads, translates and shows each line, and what that costs the PC. They change nothing the app reads or shows.":
         "أدوات هذه النسخة (Xbox) لقياس قراءة التطبيق لكل سطر وترجمته وعرضه، وما يكلّفه ذلك الجهاز. لا تغيّر شيئًا مما يقرؤه التطبيق أو يعرضه.",
       "The measurement tools could not be loaded: {e}": "تعذّر تحميل أدوات القياس: {e}",
-      "Measurement log (lines.log)": "سجل القياس (lines.log)",
+      "Measurement log (a file per session)": "سجل القياس (ملف لكل جلسة)",
       "Records what happens to each line read — first seen, sent to the translator, translated (and from where), shown, hidden, sent to and drawn on a TV — and why a line was lost. For measurements only: it changes nothing the app reads or shows. Off by default.":
         "يسجّل ما يجري لكل سطر مقروء — أول ظهور، والإرسال إلى المترجم، والترجمة (ومصدرها)، والعرض، والإخفاء، والإرسال إلى التلفاز ورسمه عليه — وسبب فقد أي سطر. للقياس فقط: لا يغيّر شيئًا مما يقرؤه التطبيق أو يعرضه. مطفأ افتراضيًا.",
-      "Log size (MB; the file and one older copy are kept)": "حجم السجل (ميغابايت؛ يُحتفظ بالملف ونسخة أقدم واحدة)",
+      "Size of a log part (MB; a session goes on in a new part when one is full: nothing is deleted)": "حجم جزء السجل (ميغابايت؛ تكمل الجلسة في جزء جديد عند امتلائه: لا يُحذف شيء)",
       "Open the log's folder": "افتح مجلد السجل",
       "The fork's settings could not be saved: {e}": "تعذّر حفظ إعدادات النسخة: {e}",
       "Version {version} of the original app is out. This copy (Xbox) doesn't install it: its changes come merged into this copy's own builds.":
@@ -82,10 +82,10 @@
     }
     sec.innerHTML = `${head}
       <div class="form" id="fork-measure-form">
-        <label class="check" style="color:var(--text);font-weight:600"><input type="checkbox" id="fork-log" ${s.line_log ? "checked" : ""}/> ${esc(t("Measurement log (lines.log)"))}</label>
+        <label class="check" style="color:var(--text);font-weight:600"><input type="checkbox" id="fork-log" ${s.line_log ? "checked" : ""}/> ${esc(t("Measurement log (a file per session)"))}</label>
         <div class="muted small" style="margin:-6px 0 0">${esc(t("Records what happens to each line read — first seen, sent to the translator, translated (and from where), shown, hidden, sent to and drawn on a TV — and why a line was lost. For measurements only: it changes nothing the app reads or shows. Off by default."))}</div>
-        <div class="field"><label>${esc(t("Log size (MB; the file and one older copy are kept)"))}</label><div class="inline">
-          <input type="number" id="fork-log-mb" min="1" max="64" step="1" value="${Number(s.line_log_mb) || 1}" style="width:6em" /></div></div>
+        <div class="field"><label>${esc(t("Size of a log part (MB; a session goes on in a new part when one is full: nothing is deleted)"))}</label><div class="inline">
+          <input type="number" id="fork-log-mb" min="16" max="64" step="1" value="${Number(s.line_log_mb) || 16}" style="width:6em" /></div></div>
         <button class="btn" id="fork-log-open">${esc(t("Open the log's folder"))}</button>
       </div>`;
     const save = async (change) => {
@@ -100,7 +100,7 @@
       if (mb && settings) mb.value = settings.line_log_mb;
     };
     sec.querySelector("#fork-log").addEventListener("change", (e) => save({ line_log: e.target.checked }));
-    sec.querySelector("#fork-log-mb").addEventListener("change", (e) => save({ line_log_mb: Math.min(Math.max(Math.round(Number(e.target.value) || 1), 1), 64) }));
+    sec.querySelector("#fork-log-mb").addEventListener("change", (e) => save({ line_log_mb: Math.min(Math.max(Math.round(Number(e.target.value) || 16), 16), 64) }));
     sec.querySelector("#fork-log-open").addEventListener("click", () => invoke("fork_open_log_folder").catch(() => {}));
   }
   drawMeasure();

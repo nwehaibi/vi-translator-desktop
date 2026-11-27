@@ -11,7 +11,7 @@
 #   signature; this copy's updates are installed by hand) and its SHA-256;
 # - vi-translator-xbox-measurement-tools: the memory-equivalence tool built from the original's core and
 #   from this copy's, and memory-check.cmd to compare them on your own translation memory (it stays on
-#   your PC).
+#   your PC); and the measurement log's analyzer (fork_advise.exe: advice on the five timing settings).
 # The app's version stays the original's it is based on (downloaded page scripts check it).
 name: Fork build (Windows x64)
 
@@ -84,8 +84,9 @@ jobs:
           set -euo pipefail
           mkdir -p out/tools
           base="$(tr -d '[:space:]' < .fork/base-commit)"
-          cargo build --release --target "$TARGET" -p vi-translator-core --example fork_memory_equivalence
+          cargo build --release --target "$TARGET" -p vi-translator-core --example fork_memory_equivalence --example fork_advise
           cp "target/$TARGET/release/examples/fork_memory_equivalence.exe" out/tools/fork_memory_equivalence-fork.exe
+          cp "target/$TARGET/release/examples/fork_advise.exe" out/tools/fork_advise.exe
           git worktree add --detach ../vit-base "$base"
           mkdir -p ../vit-base/core/examples
           cp core/examples/fork_memory_equivalence.rs ../vit-base/core/examples/

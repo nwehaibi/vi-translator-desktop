@@ -16,9 +16,10 @@ pub const FILE: &str = "fork-settings.json";
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ForkSettings {
-    /// The per-line measurement log (`lines.log` in the data folder): off by default.
+    /// The per-line measurement log (a file per session in `lines/` in the data folder): off by default.
     pub line_log: bool,
-    /// Its size before it rotates, in MB (the file and one older copy are kept): 1 to 64.
+    /// The size of a part of a session's file, in MB (a full part goes on in the next one; nothing is
+    /// deleted): 16 to 64.
     pub line_log_mb: u32,
     /// Install updates of the original app from the update banner. Off: the banner only tells that a
     /// new original version is out (installing it would replace this build and its Xbox support).
@@ -27,14 +28,15 @@ pub struct ForkSettings {
 
 impl Default for ForkSettings {
     fn default() -> Self {
-        Self { line_log: false, line_log_mb: 1, install_upstream_updates: false }
+        Self { line_log: false, line_log_mb: 16, install_upstream_updates: false }
     }
 }
 
 impl ForkSettings {
     /// Kept within what the app uses (a hand-edited file can hold anything).
     pub fn sanitize(&mut self) {
-        self.line_log_mb = self.line_log_mb.clamp(1, 64);
+        // (16 at the least: a session's file was 1 MB before parts, an older settings file keeps that)
+        self.line_log_mb = self.line_log_mb.clamp(16, 64);
     }
 }
 
@@ -89,6 +91,7 @@ mod tests {
         let saved = save(ForkSettings { line_log: true, line_log_mb: 500, ..s }).unwrap();
         assert_eq!(saved.line_log_mb, 64, "kept within range");
         assert_eq!(load(&dir), saved);
+        assert_eq!(save(ForkSettings { line_log_mb: 1, ..saved.clone() }).unwrap().line_log_mb, 16, "16 MB a part at the least");
         // a broken file reads as the defaults
         std::fs::write(file(&dir), b"{not json").unwrap();
         assert_eq!(load(&dir), ForkSettings::default());

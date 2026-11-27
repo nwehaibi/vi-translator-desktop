@@ -23,8 +23,26 @@
 //! - `tv_sent`     {tv, version, shown}: the overlays' state sent to a TV ({area: line's `at`});
 //! - `tv_drawn`    {tv, version, sent, recv, draw_ms, est}: the TV drew it (`est`: when, on this PC's clock).
 //!
-//! The file rotates at `line_log_mb` MB (it and `lines.log.1` are kept). Readings are summed up once a
-//! second, not written one by one; repeated `filtered` events for the same text are written once.
+//! Version 2 (`log` {version: 2}) adds, for each line's timeline (see timeline.rs and FORK.md):
+//! - `seen`        + {prev_captured, prev_text, known}: the frame read before (its time, text in it or
+//!                 not: the English appeared between them), and whether the memory knows the reading;
+//! - `sent`        + {appear_after, appear_by}: the frames the line appeared between;
+//! - `shown`       + {ar}: the Arabic as drawn;
+//! - `gap`         {area, seq, frames, last_present, first_absent, last_absent, back, text_px, other}: an OCR
+//!                 blink of the line up (`text_px`: frames whose pixels still showed text);
+//! - `ended`       {area, seq, how, by, last_present, first_absent, absent_frames, absent_text_px,
+//!                 absent_other}: the line up ended (`how`: gone, replaced, page, language);
+//! - `unread`      {area, from, to, frames, score, reasons, then_read}: text on screen the reading accepted
+//!                 nothing of (a line lost), with the filters' reasons meanwhile;
+//! - `reads`       + {stream_fps, copy_ms, preview_ms, age_ms, idle_ms, same_frame, done_ms, reader_cpu_ms,
+//!                 log_ms, det, detect_ms}: the source's frames, what taking one costs, a pass's frame age
+//!                 and wait, the reading thread's CPU, the log's own cost, the unread-text finder.
+//!
+//! One file per session (each time the log is turned on): `lines/lines-<UTC date and time>.log` in the data
+//! folder; at `line_log_mb` MB it goes on in a further part (`…-part2.log`, `…-part3.log` …), nothing is
+//! deleted (the log's older single file, `lines.log` and `lines.log.1`, is left as it is and still read by
+//! the tools). Readings are summed up once a second, not written one by one; repeated `filtered` events for
+//! the same text are written once.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Write as _;
@@ -38,13 +56,20 @@ use serde_json::{Value, json};
 /// Why text read in an area was left out (`filtered` events), as the reading decides it.
 pub const REASONS: [&str; 7] = ["clean", "not_centered", "no_bottom_line", "help_anchor", "help_not_sentence", "not_words", "reviewed_only"];
 
-/// The log's file name in the data folder.
+/// The folder of the log's sessions in the data folder (one file per session, and its further parts).
+pub const DIR: &str = "lines";
+
+/// The log's older single file (before sessions), still read by the tools (`session_files`).
 pub const FILE: &str = "lines.log";
+
+/// The most parts a session's file goes on in (a guard against a full disk: at 16 MB a part, far more than
+/// any session writes — about 3 MB in half an hour).
+const MAX_PARTS: u32 = 256;
 
 static ON: AtomicBool = AtomicBool::new(false);
 
 struct Sinks {
-    /// the file written to (by its own thread), its size limit and the way to it
+    /// the sessions' folder written to (by its own thread), the size limit of a part and the way to it
     file: Option<(PathBuf, u64, mpsc::Sender<String>)>,
     /// events kept in memory too (the replay tool, tests)
     collector: Option<Arc<Mutex<Vec<Value>>>>,
@@ -63,29 +88,34 @@ fn refresh(s: &Sinks) {
     // over the time it was off)
     *SETTINGS.lock().unwrap() = None;
     *READS.lock().unwrap() = None;
+    super::timeline::reset();
 }
 
-/// Write the log to `path` (None: stop writing it), rotating at `max_mb` MB.
-pub fn configure_file(path: Option<PathBuf>, max_mb: u32) {
+/// Write the log in the folder `dir` (None: stop writing it): a new session's file, going on in further
+/// parts of `max_mb` MB each (nothing deleted). The same folder and size again: the session goes on.
+pub fn configure_file(dir: Option<PathBuf>, max_mb: u32) {
     let max = u64::from(max_mb.clamp(1, 64)) * 1024 * 1024;
     {
         let mut s = SINKS.lock().unwrap();
-        if let (Some((p, m, _)), Some(np)) = (&s.file, &path) {
-            if p == np && *m == max {
+        if let (Some((d, m, _)), Some(nd)) = (&s.file, &dir) {
+            if d == nd && *m == max {
                 return;
             }
         }
         // (the old writer ends once it has written what it was sent)
-        s.file = path.map(|p| {
+        s.file = dir.map(|d| {
             let (tx, rx) = mpsc::channel::<String>();
-            let pc = p.clone();
-            let _ = std::thread::Builder::new().name("lines.log".into()).spawn(move || write_loop(&pc, max, rx));
-            (p, max, tx)
+            let stem = session_stem(&d, unix_ms());
+            let dc = d.clone();
+            let _ = std::thread::Builder::new().name("lines.log".into()).spawn(move || write_loop(&dc, &stem, max, rx));
+            (d, max, tx)
         });
         refresh(&s);
     }
     if on() {
-        emit("log", json!({ "app": crate::VERSION, "state": "on" }));
+        // (the machine's logical CPUs: what a share of "the whole machine" is a share of)
+        let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+        emit("log", json!({ "app": crate::VERSION, "state": "on", "version": 2, "cpus": cpus }));
     }
 }
 
@@ -96,30 +126,78 @@ pub fn set_collector(collector: Option<Arc<Mutex<Vec<Value>>>>) {
     refresh(&s);
 }
 
-/// The older copy kept when the log rotates.
+/// The older copy the log's older single file (`lines.log`) kept when it rotated.
 pub fn rotated(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(".1");
     PathBuf::from(s)
 }
 
-fn write_loop(path: &Path, max: u64, rx: mpsc::Receiver<String>) {
-    let open = |p: &Path| std::fs::OpenOptions::new().create(true).append(true).open(p);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+/// A UTC time as `YYYY-MM-DD_HH-MM-SSZ` (a file name's: no colons).
+pub fn utc_stamp(unix_ms: u64) -> String {
+    let secs = unix_ms / 1000;
+    let (days, rest) = (secs / 86_400, secs % 86_400);
+    // (days since 1970-01-01 to a civil date: H. Hinnant's algorithm)
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}_{:02}-{:02}-{:02}Z", rest / 3600, rest % 3600 / 60, rest % 60)
+}
+
+/// A new session's name in `dir`: `lines-<UTC time>` (another session started the same second: `-2` …).
+fn session_stem(dir: &Path, now_ms: u64) -> String {
+    let base = format!("lines-{}", utc_stamp(now_ms));
+    let mut stem = base.clone();
+    let mut n = 2;
+    while dir.join(format!("{stem}.log")).exists() {
+        stem = format!("{base}-{n}");
+        n += 1;
     }
-    let Ok(mut f) = open(path) else { return };
-    let mut size = f.metadata().map(|m| m.len()).unwrap_or(0);
+    stem
+}
+
+/// A session's part `k` (1: its first file).
+fn part_path(dir: &Path, stem: &str, k: u32) -> PathBuf {
+    if k <= 1 { dir.join(format!("{stem}.log")) } else { dir.join(format!("{stem}-part{k}.log")) }
+}
+
+/// Every file of the session `path` is part of, in order: the session's parts (`lines-….log`,
+/// `…-part2.log` …), or the older single file with its older copy first (`lines.log.1`, `lines.log`).
+pub fn session_files(path: &Path) -> Vec<PathBuf> {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    if let Some(stem) = name.strip_suffix(".log").filter(|n| n.starts_with("lines-")) {
+        // (any part given: the session's own name)
+        let stem = match stem.rsplit_once("-part") {
+            Some((s, k)) if k.parse::<u32>().is_ok() => s,
+            _ => stem,
+        };
+        return (1..=MAX_PARTS).map(|k| part_path(&dir, stem, k)).take_while(|p| p.exists()).collect();
+    }
+    [rotated(path), path.to_path_buf()].into_iter().filter(|p| p.exists()).collect()
+}
+
+fn write_loop(dir: &Path, stem: &str, max: u64, rx: mpsc::Receiver<String>) {
+    let open = |p: &Path| std::fs::OpenOptions::new().create(true).append(true).open(p);
+    let _ = std::fs::create_dir_all(dir);
+    let mut part = 1u32;
+    let Ok(mut f) = open(&part_path(dir, stem, part)) else { return };
+    let mut size = 0u64;
     for line in rx {
         let n = line.len() as u64 + 1;
-        if size > 0 && size + n > max {
-            drop(f);
-            let old = rotated(path);
-            let _ = std::fs::remove_file(&old);
-            let _ = std::fs::rename(path, &old);
-            let Ok(nf) = open(path) else { return };
+        // (a part full: the session goes on in the next one; nothing is deleted)
+        if size > 0 && size + n > max && part < MAX_PARTS {
+            part += 1;
+            let Ok(nf) = open(&part_path(dir, stem, part)) else { return };
             f = nf;
-            size = 0;
+            let head = json!({ "ev": "log", "state": "part", "part": part, "session": stem, "t": unix_ms() }).to_string();
+            size = if f.write_all(head.as_bytes()).and_then(|_| f.write_all(b"\n")).is_ok() { head.len() as u64 + 1 } else { 0 };
         }
         if f.write_all(line.as_bytes()).and_then(|_| f.write_all(b"\n")).is_ok() {
             size += n;
@@ -143,6 +221,7 @@ pub fn emit(ev: &str, fields: Value) {
     if !on() {
         return;
     }
+    let t0 = Instant::now();
     let mut obj = match fields {
         Value::Object(m) => m,
         _ => serde_json::Map::new(),
@@ -157,6 +236,21 @@ pub fn emit(ev: &str, fields: Value) {
     if let Some((_, _, tx)) = &s.file {
         let _ = tx.send(v.to_string());
     }
+    drop(s);
+    add_self(t0.elapsed());
+}
+
+thread_local! {
+    /// the time this thread spent in the log's own work since its last per-second readings (the reading's
+    /// thread: what the log costs the reading)
+    static SELF_TIME: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+    /// this pass's start (Unix ms), the last pass's end and frame (the reading's thread)
+    static PASS: std::cell::Cell<(u64, Option<Instant>, Option<Instant>, Option<u64>)> = const { std::cell::Cell::new((0, None, None, None)) };
+}
+
+/// Time spent in the log's own work on this thread.
+pub(crate) fn add_self(d: Duration) {
+    SELF_TIME.with(|s| s.set(s.get() + d));
 }
 
 /// A text as it goes into the log: at most 300 characters.
@@ -191,6 +285,28 @@ pub fn note_captured(seq: u64, w: u32, h: u32) {
 pub fn note_preview() {
     if on() {
         PREVIEWS_NOW.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A frame arrived from the source (the window's capture: all of them, not only those taken).
+pub fn note_arrived() {
+    if on() {
+        ARRIVED_NOW.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Taking a full frame (copying it out of the capture) took `d`.
+pub fn note_copy_cost(d: Duration) {
+    if on() {
+        COPY_US.fetch_add(d.as_micros() as u64, Ordering::Relaxed);
+        COPY_N.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Making a preview frame (shrinking it, or encoding it as JPEG) took `d`.
+pub fn note_preview_cost(d: Duration) {
+    if on() {
+        PREVIEW_US.fetch_add(d.as_micros() as u64, Ordering::Relaxed);
     }
 }
 
@@ -258,6 +374,11 @@ pub fn captured_of(seq: u64) -> Option<u64> {
 /// and the last full frame's size.
 static FRAMES_NOW: AtomicU32 = AtomicU32::new(0);
 static PREVIEWS_NOW: AtomicU32 = AtomicU32::new(0);
+/// frames arrived from the source, and the time spent taking full frames and making preview ones (µs)
+static ARRIVED_NOW: AtomicU32 = AtomicU32::new(0);
+static COPY_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static COPY_N: AtomicU32 = AtomicU32::new(0);
+static PREVIEW_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FRAME_W: AtomicU32 = AtomicU32::new(0);
 static FRAME_H: AtomicU32 = AtomicU32::new(0);
 
@@ -276,6 +397,19 @@ struct Reads {
     /// each part of the passes (pages, phone, chat, areas, and what comes before them): total ms
     stages: HashMap<&'static str, f64>,
     suppressed: u32,
+    /// the reading thread's own CPU time when this second's readings began (ms)
+    thread_cpu: Option<f64>,
+    /// a pass's frame: its age when the pass began (ms), the time since the pass before ended (ms), and
+    /// passes on a frame read before (no new one came)
+    age: (u32, f64),
+    idle: (u32, f64),
+    same_frame: u32,
+    /// each area: the time from the pass's start to its reading done (ms)
+    done: HashMap<String, (u32, f64)>,
+    /// the unread-text finder: the pixels' text × the reading's (both, pixels only, reading only, neither),
+    /// and its time
+    det: [u32; 4],
+    detect: (u32, Duration),
 }
 
 static READS: Mutex<Option<Reads>> = Mutex::new(None);
@@ -287,8 +421,14 @@ fn with_reads(f: impl FnOnce(&mut Reads)) {
         let now = Instant::now();
         let since = *r.since.get_or_insert_with(|| {
             r.cpu = super::cpu::now();
+            r.thread_cpu = super::cpu::thread_ms();
             FRAMES_NOW.store(0, Ordering::Relaxed);
             PREVIEWS_NOW.store(0, Ordering::Relaxed);
+            ARRIVED_NOW.store(0, Ordering::Relaxed);
+            COPY_US.store(0, Ordering::Relaxed);
+            COPY_N.store(0, Ordering::Relaxed);
+            PREVIEW_US.store(0, Ordering::Relaxed);
+            SELF_TIME.with(|s| s.set(Duration::ZERO));
             now
         });
         f(r);
@@ -307,6 +447,13 @@ fn with_reads(f: impl FnOnce(&mut Reads)) {
             .iter()
             .map(|(a, (n, t))| (a.clone(), json!({ "n": n, "avg": round1(t / f64::from((*n).max(1))) })))
             .collect();
+        let secs = span.as_secs_f64();
+        let previews = PREVIEWS_NOW.load(Ordering::Relaxed);
+        let (copy_us, copy_n) = (COPY_US.swap(0, Ordering::Relaxed), COPY_N.swap(0, Ordering::Relaxed));
+        let preview_us = PREVIEW_US.swap(0, Ordering::Relaxed);
+        let avg = |(n, t): (u32, f64)| (n > 0).then(|| round1(t / f64::from(n)));
+        let thread_cpu = super::cpu::thread_ms();
+        let log_ms = SELF_TIME.with(|s| s.replace(Duration::ZERO)).as_secs_f64() * 1000.0;
         let ev = json!({
             "n": r.n, "ocr_avg": round1(r.total / f64::from(r.n.max(1))), "ocr_max": round1(r.max),
             "pass_n": r.passes, "pass_avg": round1(r.pass_total / f64::from(r.passes.max(1))), "pass_max": round1(r.pass_max),
@@ -315,8 +462,21 @@ fn with_reads(f: impl FnOnce(&mut Reads)) {
             "stages": r.stages.iter().map(|(k, v)| ((*k).to_string(), json!(round1(v / f64::from(r.passes.max(1)))))).collect::<serde_json::Map<String, Value>>(),
             "cpu_app": shares.map(|s| s.0), "cpu_all": shares.map(|s| s.1), "fps": fps, "preview_fps": preview_fps,
             "frame_w": (fw > 0).then_some(fw), "frame_h": (fh > 0).then_some(fh),
+            // (v2) frames arriving from the source a second; taking a full frame and making a preview one (ms each)
+            "stream_fps": round1(f64::from(ARRIVED_NOW.swap(0, Ordering::Relaxed)) / secs),
+            "copy_ms": (copy_n > 0).then(|| round1(copy_us as f64 / 1000.0 / f64::from(copy_n))),
+            "preview_ms": (previews > 0 && preview_us > 0).then(|| round1(preview_us as f64 / 1000.0 / f64::from(previews))),
+            // (v2) a pass's frame: its age when the pass began, the wait since the pass before, passes on an old frame
+            "age_ms": avg(r.age), "idle_ms": avg(r.idle), "same_frame": r.same_frame,
+            "done_ms": r.done.iter().map(|(a, v)| (a.clone(), json!(avg(*v)))).collect::<serde_json::Map<String, Value>>(),
+            // (v2) the reading thread's CPU this second, and the log's own work on it (ms)
+            "reader_cpu_ms": r.thread_cpu.zip(thread_cpu).map(|(a, b)| round1((b - a).max(0.0))),
+            "log_ms": round1(log_ms),
+            // (v2) the unread-text finder: text in the pixels × text read (tt, tn: pixels only, nt: read only, nn)
+            "det": { "tt": r.det[0], "tn": r.det[1], "nt": r.det[2], "nn": r.det[3] },
+            "detect_ms": (r.detect.0 > 0).then(|| (r.detect.1.as_secs_f64() * 1000.0 / f64::from(r.detect.0) * 1000.0).round() / 1000.0),
         });
-        *r = Reads { since: Some(now), cpu: cpu_now, ..Reads::default() };
+        *r = Reads { since: Some(now), cpu: cpu_now, thread_cpu, ..Reads::default() };
         ev
     };
     emit("reads", event);
@@ -349,7 +509,56 @@ thread_local! {
 /// A reading pass starts (its first part: what comes before the pages).
 pub fn pass_start() {
     if on() {
-        STAGE.with(|s| *s.borrow_mut() = Some(("setup", Instant::now())));
+        let now = Instant::now();
+        STAGE.with(|s| *s.borrow_mut() = Some(("setup", now)));
+        PASS.with(|p| {
+            let (_, _, end, frame) = p.get();
+            p.set((unix_ms(), Some(now), end, frame));
+        });
+    }
+}
+
+/// The pass that began at `pass_start` read frame `seq`: how old the frame was then, how long since the
+/// pass before ended, and whether it's the frame that pass read (no new one came).
+pub(crate) fn note_pass_frame(seq: Option<u64>) {
+    let (start_ms, start, end, last) = PASS.with(|p| p.get());
+    let age = seq.and_then(captured_of).filter(|_| start_ms > 0).map(|c| start_ms.saturating_sub(c) as f64);
+    let idle = start.zip(end).map(|(s, e)| s.saturating_duration_since(e).as_secs_f64() * 1000.0);
+    let same = seq.is_some() && seq == last;
+    PASS.with(|p| p.set((start_ms, start, end, seq.or(last))));
+    if let Some(r) = READS.lock().unwrap().as_mut() {
+        if let Some(a) = age {
+            r.age.0 += 1;
+            r.age.1 += a;
+        }
+        if let Some(i) = idle {
+            r.idle.0 += 1;
+            r.idle.1 += i;
+        }
+        r.same_frame += u32::from(same);
+    }
+}
+
+/// An area's reading is done (its time since the pass began).
+pub(crate) fn note_area_done(area: &str) {
+    let Some(start) = PASS.with(|p| p.get().1) else { return };
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    if let Some(r) = READS.lock().unwrap().as_mut() {
+        let e = r.done.entry(area.to_string()).or_default();
+        e.0 += 1;
+        e.1 += ms;
+    }
+}
+
+/// The unread-text finder's verdicts this pass (both, pixels only, reading only, neither), and its time.
+pub(crate) fn note_presence(counts: [u32; 4], took: Duration) {
+    let n: u32 = counts.iter().sum();
+    if let Some(r) = READS.lock().unwrap().as_mut() {
+        for (a, b) in r.det.iter_mut().zip(counts) {
+            *a += b;
+        }
+        r.detect.0 += n;
+        r.detect.1 += took;
     }
 }
 
@@ -372,6 +581,10 @@ pub fn pass_sample(ms: f64) {
     if !on() {
         return;
     }
+    PASS.with(|p| {
+        let (s, st, _, f) = p.get();
+        p.set((s, st, Some(Instant::now()), f));
+    });
     // (its last part ends now)
     let last = STAGE.with(|s| s.borrow_mut().take()).map(|(name, since)| (name, since.elapsed().as_secs_f64() * 1000.0));
     with_reads(|r| {
@@ -409,6 +622,7 @@ pub fn filtered(area: &str, reason: &str, text: &str) {
     if !on() {
         return;
     }
+    super::timeline::note_reason(area, reason);
     let key = norm(text);
     if key.is_empty() {
         return;
@@ -565,22 +779,42 @@ mod tests {
     }
 
     #[test]
-    fn fork_linelog_file_rotates_and_keeps_one_older_copy() {
+    fn fork_linelog_session_goes_on_in_parts_and_loses_nothing() {
         let dir = std::env::temp_dir().join(format!("vit-linelog-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(FILE);
+        let stem = session_stem(&dir, 1_795_729_676_497);
+        assert_eq!(stem, "lines-2026-11-26_21-47-56Z", "the session's UTC time in its name");
         let (tx, rx) = mpsc::channel::<String>();
         for i in 0..20 {
             tx.send(format!("{{\"n\":{i},\"pad\":\"{}\"}}", "x".repeat(40))).unwrap();
         }
         drop(tx);
-        write_loop(&path, 300, rx);
-        let now = std::fs::read_to_string(&path).unwrap();
-        let old = std::fs::read_to_string(rotated(&path)).unwrap();
-        assert!(now.len() <= 300 && old.len() <= 300, "each file within the limit");
-        assert!(now.contains("\"n\":19"), "the newest line is in the file");
-        assert!(!now.contains("\"n\":0,") && !old.contains("\"n\":0,"), "the oldest went with the rotation");
+        write_loop(&dir, &stem, 300, rx);
+        let files = session_files(&dir.join(format!("{stem}-part2.log")));
+        assert!(files.len() >= 3, "{files:?}");
+        assert_eq!(files[0], dir.join(format!("{stem}.log")), "any part finds the whole session, in order");
+        let all: Vec<Value> = files.iter().flat_map(|f| std::fs::read_to_string(f).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect::<Vec<Value>>()).collect();
+        let ns: Vec<u64> = all.iter().filter_map(|e| e["n"].as_u64()).collect();
+        assert_eq!(ns, (0..20).collect::<Vec<u64>>(), "every line kept, in order");
+        assert!(all.iter().any(|e| e["ev"] == "log" && e["state"] == "part" && e["part"] == 2), "a part says it is one");
+        for f in &files {
+            assert!(std::fs::metadata(f).unwrap().len() <= 300 + 100, "{f:?} within the limit (and its header)");
+        }
+        // a second session the same second: a name of its own
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(session_stem(&dir, 1_795_729_676_497), format!("{stem}-2"));
+        // the older single file: its older copy first
+        let old = dir.join(FILE);
+        std::fs::write(&old, "{}\n").unwrap();
+        std::fs::write(rotated(&old), "{}\n").unwrap();
+        assert_eq!(session_files(&old), vec![rotated(&old), old.clone()]);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fork_linelog_utc_stamps() {
+        assert_eq!(utc_stamp(0), "1970-01-01_00-00-00Z");
+        assert_eq!(utc_stamp(951_782_400_000), "2000-02-29_00-00-00Z");
+        assert_eq!(utc_stamp(1_795_773_617_119), "2026-11-27_10-00-17Z");
     }
 
     #[test]

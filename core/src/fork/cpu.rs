@@ -31,6 +31,11 @@ pub fn process_ms() -> Option<f64> {
     imp::now().map(|t| t.process_ms)
 }
 
+/// The calling thread's own CPU time so far (ms): the reading thread's, for the log's per-second readings.
+pub fn thread_ms() -> Option<f64> {
+    imp::thread_ms()
+}
+
 #[cfg(windows)]
 mod imp {
     // (kernel32 itself: no new dependency; FILETIME is two 32-bit halves, low first: a u64)
@@ -39,6 +44,15 @@ mod imp {
         fn GetCurrentProcess() -> isize;
         fn GetProcessTimes(process: isize, creation: *mut u64, exit: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
         fn GetSystemTimes(idle: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
+        fn GetCurrentThread() -> isize;
+        fn GetThreadTimes(thread: isize, creation: *mut u64, exit: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
+    }
+
+    pub fn thread_ms() -> Option<f64> {
+        let (mut c, mut e, mut k, mut u) = (0u64, 0u64, 0u64, 0u64);
+        // SAFETY: plain out-parameters of the documented sizes; the thread handle is the pseudo-handle
+        let ok = unsafe { GetThreadTimes(GetCurrentThread(), &mut c, &mut e, &mut k, &mut u) != 0 };
+        ok.then(|| (k + u) as f64 / 10_000.0)
     }
 
     pub fn now() -> Option<super::Times> {
@@ -73,11 +87,22 @@ mod imp {
         let idle = v.get(3)? + v.get(4).copied().unwrap_or(0.0);
         Some(super::Times { process_ms: (ut + st) * TICK_MS, busy_ms: (total - idle) * TICK_MS, total_ms: total * TICK_MS })
     }
+
+    pub fn thread_ms() -> Option<f64> {
+        let stat = std::fs::read_to_string("/proc/thread-self/stat").ok()?;
+        let rest = stat.rsplit_once(')')?.1;
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        let (ut, st): (f64, f64) = (f.get(11)?.parse().ok()?, f.get(12)?.parse().ok()?);
+        Some((ut + st) * TICK_MS)
+    }
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
 mod imp {
     pub fn now() -> Option<super::Times> {
+        None
+    }
+    pub fn thread_ms() -> Option<f64> {
         None
     }
 }
@@ -107,6 +132,7 @@ mod tests {
         std::hint::black_box(x);
         let b = now().expect("CPU times");
         assert!(b.process_ms > a.process_ms, "{a:?} {b:?}");
+        assert!(thread_ms().is_some_and(|t| t > 0.0), "this thread's own CPU time");
         assert!(b.total_ms > a.total_ms && b.busy_ms >= a.busy_ms, "{a:?} {b:?}");
     }
 }

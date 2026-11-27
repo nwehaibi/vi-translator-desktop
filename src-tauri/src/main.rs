@@ -802,6 +802,7 @@ fn preview_loop(app: AppHandle, cfg: Arc<Mutex<Config>>, shared: Arc<Shared>) {
             if enc.encode(&f.rgba, f.w as u16, f.h as u16, jpeg_encoder::ColorType::Rgba).is_ok() {
                 shared.put_preview_jpeg(jpeg);
             }
+            vi_translator_core::fork::linelog::note_preview_cost(t.elapsed()); // fork: measurement log
             if std::env::var_os("VI_TRANSLATOR_DEBUG").is_some() {
                 eprintln!("[preview] {}x{} JPEG in {:.1} ms", f.w, f.h, t.elapsed().as_secs_f64() * 1000.0);
             }

@@ -38,7 +38,7 @@ async function run(browser, { dev, lang, update = null }) {
   await page.addInitScript(
     ({ dev, config, langs, update }) => {
       window.__calls = [];
-      let fork = { line_log: false, line_log_mb: 1, install_upstream_updates: false };
+      let fork = { line_log: false, line_log_mb: 16, install_upstream_updates: false };
       const answers = {
         get_config: config,
         dev_build: dev,
@@ -113,6 +113,9 @@ async function run(browser, { dev, lang, update = null }) {
     .then(() => true)
     .catch(() => false);
   check(saved, `${label}: the switch saves the measurement log's setting`);
+  // a part of a session's log is 16 MB at the least (nothing is deleted when one is full)
+  const mb = await page.evaluate(() => { const i = document.getElementById("fork-log-mb"); return i ? [i.min, i.value] : null; });
+  check(mb && mb[0] === "16" && Number(mb[1]) >= 16, `${label}: a log part is 16 MB at the least (${mb})`);
   // an update of the original: announced only
   if (update) {
     const bar = await page.waitForFunction(() => !document.getElementById("update-bar").classList.contains("hidden") && /1\.4\.5/.test(document.getElementById("update-text").textContent) && document.getElementById("update-now").textContent !== "Update now", null, { timeout: 5000 }).then(() => true).catch(() => false);

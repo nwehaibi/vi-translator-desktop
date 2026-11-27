@@ -8,7 +8,7 @@ pub const NOTIFY_ONLY: &str = "This copy (Xbox) doesn't install updates of the o
 
 /// Apply the fork's switches (at start and after a change): the measurement log on or off.
 pub fn apply(data_dir: &std::path::Path, s: &settings::ForkSettings) {
-    linelog::configure_file(s.line_log.then(|| data_dir.join(linelog::FILE)), s.line_log_mb);
+    linelog::configure_file(s.line_log.then(|| data_dir.join(linelog::DIR)), s.line_log_mb);
 }
 
 /// Updates of the original app are only announced, unless the fork's switch says to install them
@@ -33,11 +33,11 @@ pub fn fork_settings_set(webview: tauri::Webview, value: settings::ForkSettings)
     Ok(s)
 }
 
-/// Open the folder the measurement log is written to (the app's data folder). Its path.
+/// Open the folder the measurement log's sessions are written to (`lines` in the app's data folder). Its path.
 #[tauri::command]
 pub fn fork_open_log_folder(webview: tauri::Webview) -> Result<String, String> {
     crate::main_only(&webview)?;
-    let dir = crate::data_dir();
+    let dir = crate::data_dir().join(linelog::DIR);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     crate::debug_frames::open_folder(&dir).map_err(|e| e.to_string())?;
     Ok(dir.display().to_string())

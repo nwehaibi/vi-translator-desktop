@@ -10,9 +10,18 @@
 //!   line was lost when it was;
 //! - `tv_timing`: when a TV was sent a line and when it drew it (Phase 0.4);
 //! - `cpu`: how much of the CPU this app and the whole system use (the log's per-second readings, for
-//!   the timing settings' calibration, Phase 0.6).
+//!   the timing settings' calibration, Phase 0.6);
+//! - `timeline`: each line's timeline for the log (its English appearing and going between two frames, its
+//!   OCR blinks, text on screen nothing was read of);
+//! - `advise`: the log's analyzer (sync, lines lost, misreadings, flicker, and advice on the five timing
+//!   settings, with how sure it is);
+//! - `presence`: text in an area from its pixels only (the log's unread-text finder: a line on screen the
+//!   OCR read nothing of, an OCR blink told from the text going).
 
+pub mod advise;
 pub mod cpu;
 pub mod linelog;
+pub mod presence;
+pub mod timeline;
 pub mod settings;
 pub mod tv_timing;

@@ -14,6 +14,10 @@
 //!   `--start <video start, Unix ms>`).
 //! - `--gold-draft <video> --out draft.json [--fps 10]`: a first draft of the reference: every line read
 //!   in the enabled areas, with when it was on screen — short lines included — to check by hand.
+//! - `--advise [<log, any part of a session, or a folder>] [--tz +3] [--out <folder>]`: the log's analyzer
+//!   (core: fork::advise): the sync of the Arabic with the English, lines lost and why, misreadings,
+//!   flicker, and advice on the five timing settings with how sure each is; written as advice-ar.txt,
+//!   advice.json and lines-review.csv. Without a log: the app's sessions folder.
 //!
 //! The reference (gold.json): a list of {id, area, start_ms, end_ms, text, short?} in the video's time.
 //! A line counts as detected when a reading of it (≥ 85 % alike, as a part of a stacked block too) was
@@ -91,6 +95,19 @@ pub fn cli(args: &[String]) -> Option<i32> {
         let report = opt("--report").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("session-summary.json"));
         let (from, to) = (opt("--from").and_then(|v| v.parse::<u64>().ok()), opt("--to").and_then(|v| v.parse::<u64>().ok()));
         return Some(finish(summarize(Path::new(&log), from, to, &report)));
+    }
+    if args.iter().any(|a| a == "--advise") {
+        let given = opt("--advise").filter(|v| !v.starts_with("--"));
+        let paths = vec![given.map(PathBuf::from).unwrap_or_else(|| crate::data_dir().join(linelog::DIR))];
+        let out = opt("--out").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("advice"));
+        let mut o = vi_translator_core::fork::advise::Options::default();
+        if let Some(tz) = opt("--tz").and_then(|v| v.replace('+', "").parse::<f64>().ok()) {
+            o.tz_minutes = (tz * 60.0) as i32;
+        }
+        return Some(finish(vi_translator_core::fork::advise::run(&paths, &out, &o).map(|(j, a, c)| {
+            eprint!("{}", std::fs::read_to_string(&a).unwrap_or_default());
+            eprintln!("\n→ {}\n→ {}\n→ {}", a.display(), j.display(), c.display());
+        })));
     }
     if let Some(video) = opt("--gold-draft") {
         let Some(out) = opt("--out") else {
@@ -913,9 +930,9 @@ fn to_csv(rows: &[Value]) -> String {
 /// video included), each second's reading times and frames, the TV's drawing, what was left out and
 /// why — over the whole session and minute by minute (a PC slowing down as it warms up shows there).
 fn summarize(log: &Path, from: Option<u64>, to: Option<u64>, report: &Path) -> anyhow::Result<()> {
-    // the older copy first (lines.log.1), then the log
+    // every file of the session, in order (a session's parts; or the older single file's older copy first)
     let mut events: Vec<Value> = Vec::new();
-    for f in [linelog::rotated(log), log.to_path_buf()] {
+    for f in linelog::session_files(log) {
         if let Ok(text) = std::fs::read_to_string(&f) {
             events.extend(text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()));
         }

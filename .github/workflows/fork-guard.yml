@@ -76,6 +76,12 @@ jobs:
       - name: The upstream sync merges as it should
         run: bash .fork/tests/sync-dry-run.sh
 
+      # (the measurement log's analyzer against the reader itself: a made-up session of known truth read by the
+      # app's own reader at two Clear after values, the analyzer's model of the one predicting the other, and
+      # the log's own cost — real time, about two minutes; see core/tests/fork_advise_validation.rs)
+      - name: The analyzer's model holds against the reader
+        run: cargo test -q --release -p vi-translator-core --test fork_advise_validation -- --ignored --nocapture
+
       # (the measurement tools in the window of a release build — the original shows its Debugging section
       # in development builds only: the real window in Chromium, the app's commands answered by a stand-in,
       # a release and a development build, English and Arabic)
