@@ -73,6 +73,7 @@
 | `core/src/tv_server.rs` | المسار `/tv/drawn` (للتلفاز المرتبط فقط)، وترويسة `X-Ack`، وتسجيل `tv_sent` |
 | `src-tauri/src/capture.rs` | زمن التقاط كل إطار وحجمه (`note_captured`)، وعدّ إطارات المعاينة (`note_preview`) مرة واحدة لكل إطار (لم يعد يُعدّ ثانية عند ترميز JPEG) |
 | `src-tauri/src/capture_windows.rs` | كل إطار يصل من البث (`note_arrived`)، وزمن أخذ الإطار الكامل (`note_copy_cost`) وإطار المعاينة (`note_preview_cost`) |
+| `src-tauri/src/obs.rs` | عدّ معاينة OBS (`note_preview`)، لأنها تصل جاهزة بصيغة JPEG ولا تمر بـ `put_preview` |
 | `src-tauri/src/main.rs` | `mod fork_cmds;`، و`mod replay;`، وأوامر القياس في سطر الأوامر، وتطبيق المفاتيح عند البدء، والإعلان فقط عن تحديثات الأصل في `install_update`، وزمن ترميز المعاينة (`note_preview_cost`) |
 | `ui/index.html` | تحميل `fork.js` |
 | `ui/tv.html` | إبلاغ الكمبيوتر بعد رسم كل حالة، ما دام السجل مفعّلًا |
@@ -80,7 +81,7 @@
 لعرض الجرد الكامل بأرقام الأسطر:
 
 ```
-git grep -n "fork:" -- core/src/engine.rs core/src/lib.rs core/src/tv_server.rs src-tauri/src/capture.rs src-tauri/src/capture_windows.rs src-tauri/src/main.rs ui/index.html ui/tv.html
+git grep -n "fork:" -- core/src/engine.rs core/src/lib.rs core/src/tv_server.rs src-tauri/src/capture.rs src-tauri/src/capture_windows.rs src-tauri/src/obs.rs src-tauri/src/main.rs ui/index.html ui/tv.html
 ```
 
 ## المفاتيح: `fork-settings.json`

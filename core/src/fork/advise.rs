@@ -1049,8 +1049,13 @@ pub fn render_ar(r: &Value) -> String {
             v(&b["frame_wait"]["p50"]), v(&b["reading"]["p50"]), v(&b["settling"]["p50"]), v(&b["translation"]["p50"]), v(&b["presenter"]["p50"]), v(&b["tv"]["p50"])
         ));
         o.push_str(&format!(
-            "- اختفاء العربية بعد الإنجليزية: على التلفزيون p50 {} / p90 {} مللي ثانية (لـ {} سطرًا اختفت إنجليزيته)\n",
-            v(&sy["end_on_tv_ms"]["p50"]), v(&sy["end_on_tv_ms"]["p90"]), sy["end_on_tv_ms"]["n"]
+            "- اختفاء العربية بعد الإنجليزية: على التلفزيون p50 {} / p90 {} مللي ثانية (لـ {} سطرًا اختفت إنجليزيته)؛ في التطبيق p50 {} / p90 {} (لـ {} سطرًا)\n",
+            v(&sy["end_on_tv_ms"]["p50"]),
+            v(&sy["end_on_tv_ms"]["p90"]),
+            sy["end_on_tv_ms"]["n"],
+            v(&sy["end_here_ms"]["p50"]),
+            v(&sy["end_here_ms"]["p90"]),
+            sy["end_here_ms"]["n"]
         ));
         o.push_str(&format!("- الوميض: {} في الدقيقة، حسب السبب: {}؛ واستبدال سريع بقراءة أخرى: {}\n", v(&seg["flicker"]["a_minute"]), seg["flicker"]["by_cause"], seg["flicker"]["variant_swaps"]));
         let l = &seg["lost"];
