@@ -721,7 +721,8 @@ fn analyze_segment(ev: &[Value], timing: Timing, cpus: Option<f64>, o: &Options)
     {
         let idle = mean(&sec.idle_ms);
         let bound = if pass_p50 >= frame_ms * 0.9 { "reader" } else if timing.interval_ms > frame_ms { "interval" } else { "frames" };
-        let value = if bound == "interval" { (frame_ms * 0.8).floor().max(16.0) } else { 16.0_f64.min(timing.interval_ms).max(16.0) };
+        // (not what holds the reading back: the value in use stays, nothing to gain from a change)
+        let value = if bound == "interval" { (frame_ms * 0.8).floor().max(16.0) } else { timing.interval_ms };
         let why = match bound {
             "frames" => format!("القراءة تنتظر كل إطار جديد: الدورة p50 ‏{pass_p50:.0} مللي ثانية أقصر من فترة الإطار ({frame_ms:.0}). فالفاصل لا يؤخر شيئًا ما دام أقل من فترة الإطار."),
             "reader" => format!("الدورة ({pass_p50:.0} مللي ثانية) أطول من فترة الإطار ({frame_ms:.0})، فالقراءة متصلة والفاصل لا أثر له. المحدِّد زمن القراءة نفسه."),
