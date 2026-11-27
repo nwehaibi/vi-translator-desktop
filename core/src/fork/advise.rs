@@ -484,6 +484,7 @@ fn analyze_segment(ev: &[Value], timing: Timing, cpus: Option<f64>, o: &Options)
     // ---- flicker: a line's Arabic down, and the same line up again within 1.5 s
     let mut flicker: BTreeMap<&str, u64> = BTreeMap::new();
     let mut spans: Vec<f64> = Vec::new();
+    let mut ocr_miss_spans: Vec<f64> = Vec::new();
     let mut examples: Vec<Value> = Vec::new();
     let clears: Vec<u64> = ev.iter().filter(|e| kind(e) == "cleared").map(t).collect();
     let nbl: Vec<u64> = ev.iter().filter(|e| kind(e) == "filtered" && s(e, "area") == "subtitles" && s(e, "reason") == "no_bottom_line").map(t).collect();
@@ -525,6 +526,9 @@ fn analyze_segment(ev: &[Value], timing: Timing, cpus: Option<f64>, o: &Options)
         *flicker.entry(cause).or_default() += 1;
         if let Some(sp) = span {
             spans.push(sp);
+            if cause == "ocr_miss" {
+                ocr_miss_spans.push(sp);
+            }
         }
         if examples.len() < 12 {
             examples.push(json!({ "at": fmt_time(down, o), "en": a.en, "cause": cause, "gone_ms": up - down }));
@@ -538,7 +542,8 @@ fn analyze_segment(ev: &[Value], timing: Timing, cpus: Option<f64>, o: &Options)
     // the OCR blinks the line stayed up over (v2): how long, and the text still there or not
     let gaps: Vec<&(f64, u64, u64)> = subs.iter().flat_map(|l| l.gaps.iter()).collect();
     spans.extend(gaps.iter().map(|g| g.0));
-    let ocr_miss_spans: Vec<f64> = gaps.iter().filter(|g| g.2 > 0).map(|g| g.0).collect();
+    // (the blinks over text still on screen: the ones that hid the line, and the ones it stayed up over)
+    ocr_miss_spans.extend(gaps.iter().filter(|g| g.2 > 0).map(|g| g.0));
 
     // ---- lines lost, and why
     let unread: Vec<&Value> = ev.iter().filter(|e| kind(e) == "unread" && s(e, "area") == "subtitles").collect();
@@ -793,26 +798,32 @@ fn stability_advice(seen: &[&Value], ev: &[Value], timing: Timing, read_ms: f64,
             "جلسة لعب أطول، أو في أماكن فيها حوار جديد لم تُترجم أسطره من قبل.".into(),
         );
     }
+    // The reader sends a new reading at a reading pass only, the k-th after its first (k = the wait over the
+    // passes' interval R, rounded up; 1 at the least: two readings of it), if it's still what's read then —
+    // so it stayed k + 1 passes (half a pass's margin either way: the passes' jitter); k − 1 passes later
+    // than with no wait.
+    let r = read_ms.max(1.0);
     let mut table = Vec::new();
     let mut best: Option<(f64, f64)> = None;
     for &sv in &[0.0f64, 50.0, 100.0, 150.0, 200.0, 300.0, 400.0] {
         let (mut premature, mut lost, mut delay) = (0u32, 0u32, 0.0f64);
+        let passes = |w: f64| (w / r).ceil().max(1.0);
         for &(stayed, sure, passing) in &unknown {
-            let wait = (if sure { sv } else { sv * 3.0 }).max(read_ms);
-            let sent = stayed >= wait;
+            let k = passes(if sure { sv } else { sv * 3.0 });
+            let sent = stayed >= (k + 0.5) * r;
             if passing && sent {
                 premature += 1;
             }
             if !passing {
                 if sent {
-                    delay += wait - read_ms;
+                    delay += (k - 1.0) * r;
                 } else {
                     lost += 1;
                 }
             }
         }
         let cost = f64::from(premature) * o.premature_ms + f64::from(lost) * o.lost_ms + delay;
-        table.push(json!({ "stable_ms": sv, "premature": premature, "lost": lost, "added_delay_ms": r1(delay), "cost": r1(cost) }));
+        table.push(json!({ "stable_ms": sv, "passes_sure": passes(sv), "passes_unsure": passes(sv * 3.0), "premature": premature, "lost": lost, "added_delay_ms": r1(delay), "cost": r1(cost) }));
         if best.is_none_or(|b| cost < b.1) {
             best = Some((sv, cost));
         }
@@ -826,7 +837,7 @@ fn stability_advice(seen: &[&Value], ev: &[Value], timing: Timing, read_ms: f64,
         Some(v),
         if n >= 30 { "medium" } else { "low" },
         format!(
-            "من {n} قراءة لم تعرفها الذاكرة: القيمة {v} توازن بين عرض قراءات ناقصة أو خاطئة ثم استبدالها، وتأخير الأسطر الجديدة فعلًا، وفقد أسطر قصيرة. الأسطر المعروفة للذاكرة تُعرض من أول قراءة في كل الأحوال."
+            "من {n} قراءة لم تعرفها الذاكرة: القيمة {v} توازن بين عرض قراءات ناقصة أو خاطئة ثم استبدالها، وتأخير الأسطر الجديدة فعلًا، وفقد أسطر قصيرة. الانتظار يتم بخطوات دورة القراءة ({r:.0} مللي ثانية)، وقراءتان على الأقل. الأسطر المعروفة للذاكرة تُعرض من أول قراءة في كل الأحوال."
         ),
         format!(
             "قراءات معروضة قبل أوانها: {} ← {}. أسطر جديدة لا تُعرض: {} ← {}. تأخير مضاف للأسطر الجديدة: {} ← {} مللي ثانية إجمالًا.",
@@ -852,47 +863,82 @@ fn clear_after_advice(spans: &[f64], ocr_miss: &[f64], gone: &[&&Line], end_tv: 
             "جلسة لعب 15 دقيقة بالسجل الإصدار 2.".into(),
         );
     }
-    // the English not read for `span` ms: the Arabic goes iff the time since it was last read passes
-    // Clear after before it's read again; a line really gone stays up this much longer (or shorter)
+    // The reader tells the English gone at a reading pass only: the Arabic goes at the first pass more than
+    // Clear after since the English was last read, and stays up over a blink whose last unread pass came
+    // sooner (`span`: from the last pass the line was read in to the last one it wasn't). So the setting
+    // works in steps of the passes' interval R: any value from k·R to (k+1)·R does the same — the Arabic
+    // stays up over blinks of up to k passes, and goes k passes after its English.
+    let r = read_ms.max(1.0);
+    let step = |a: f64| (a / r).floor();
     let base_end = quant(ends, 0.5).unwrap_or(0.0);
+    // candidates: every 10 ms from 30 to 500 and the value in use (what each would do, to compare), of which
+    // the middle of each step is the one advised (the furthest from the passes' jitter either way)
+    let middles: Vec<f64> = (0..50)
+        .map(f64::from)
+        .map(|k| (k, ((k + 0.5) * r / 10.0).round() * 10.0))
+        .filter(|&(k, a)| (30.0..=500.0).contains(&a) && step(a) == k)
+        .map(|(_, a)| a)
+        .collect();
+    let mut cands: Vec<(f64, bool)> = (3..=50).map(|k| f64::from(k) * 10.0).map(|a| (a, middles.contains(&a))).collect();
+    if !cands.iter().any(|c| c.0 == timing.clear_after_ms) {
+        cands.push((timing.clear_after_ms, false));
+        cands.sort_by(|x, y| x.0.total_cmp(&y.0));
+    }
     let mut table = Vec::new();
     let mut best: Option<(f64, f64)> = None;
-    let mut cands: Vec<f64> = vec![50.0, 70.0, 100.0, 130.0, 160.0, 200.0, 250.0, 300.0, 400.0];
-    if !cands.contains(&timing.clear_after_ms) {
-        cands.push(timing.clear_after_ms);
-        cands.sort_by(|a, b| a.total_cmp(b));
-    }
-    for &a in &cands {
+    for &(a, middle) in &cands {
         let flickers = spans.iter().filter(|&&sp| sp > a).count() as f64;
-        let shift = a - timing.clear_after_ms;
+        let shift = (step(a) - step(timing.clear_after_ms)) * r;
         let late: f64 = ends.iter().map(|e| (e + shift).max(0.0)).sum();
         let cost = flickers * o.flicker_ms + late;
-        table.push(json!({ "clear_after_ms": a, "flickers": flickers, "flickers_a_minute": r1(flickers / minutes.max(0.1)), "end_lag_p50_ms": r1(base_end + shift), "cost": r1(cost) }));
-        if best.is_none_or(|b| cost < b.1) {
+        table.push(json!({ "clear_after_ms": a, "passes": step(a), "flickers": flickers, "flickers_a_minute": r1(flickers / minutes.max(0.1)), "end_lag_p50_ms": r1(base_end + shift), "cost": r1(cost) }));
+        if middle && best.is_none_or(|b| cost < b.1) {
             best = Some((a, cost));
         }
     }
-    let (v, _) = best.unwrap_or((timing.clear_after_ms, 0.0));
+    let (mid, _) = best.unwrap_or((timing.clear_after_ms, 0.0));
+    // the value in use, if it's in the best step already and clear of its edges: nothing to change
+    let cur = timing.clear_after_ms;
+    let clear_of_edges = (cur - step(cur) * r).min((step(cur) + 1.0) * r - cur) >= 0.2 * r;
+    let v = if step(cur) == step(mid) && clear_of_edges { cur } else { mid };
     let row = |x: f64| table.iter().find(|r| r["clear_after_ms"].as_f64() == Some(x)).cloned().unwrap_or_default();
-    let (now, rec) = (row(timing.clear_after_ms), row(v));
+    let (now, rec) = (row(cur), row(v));
     let p95_miss = quant(ocr_miss, 0.95);
+    let (lo, hi) = (step(v) * r, (step(v) + 1.0) * r);
     advice(
         "clear_after_ms",
-        timing.clear_after_ms,
+        cur,
         Some(v),
         if spans.len() >= 10 && ends.len() >= 30 { "high" } else { "medium" },
         format!(
-            "خلال الجلسة انقطعت قراءة سطر ظاهر {} مرة، منها {} والنص ما زال على الشاشة (خطأ قراءة). القيمة {v} أقل قيمة توازن بين إخفاء العربية والإنجليزية ما زالت ظاهرة (وميض)، وبقائها بعد اختفاء الإنجليزية. القراءة تجري كل {read_ms:.0} مللي ثانية.",
+            "القراءة تجري كل {r:.0} مللي ثانية، ولا يحكم التطبيق باختفاء النص إلا عند قراءة، فهذا الإعداد يعمل بخطوات من {r:.0}: كل القيم من {lo:.0} إلى أقل من {hi:.0} متكافئة، {}. خلال الجلسة انقطعت قراءة سطر ظاهر {} مرة، منها {} والنص ما زال على الشاشة (خطأ قراءة). القيمة {v} أقل كلفة وفق المعيار: الوميض مقابل بقاء العربية بعد الإنجليزية (الوميض الواحد يُحسب بـ {:.1} ثانية من البقاء). هذه القيمة لمعدل الالتقاط الحالي: إن تغيّر Capture FPS تتغير الخطوة.",
+            if step(v) < 1.0 {
+                "تُخفي العربية عند أول قراءة لا يُرى فيها النص، فأي انقطاع قراءة يسبب وميضًا".to_string()
+            } else {
+                format!("تُبقي العربية فوق انقطاع قراءة حتى {n}، وتؤخر إخفاءها {n} بعد اختفاء الإنجليزية", n = passes_ar(step(v)))
+            },
             spans.len(),
-            ocr_miss.len()
+            ocr_miss.len(),
+            o.flicker_ms / 1000.0
         ),
         format!(
             "الوميض: {} ← {} في الدقيقة. تأخر اختفاء العربية عن الإنجليزية (p50): {} ← {} مللي ثانية.",
             now["flickers_a_minute"], rec["flickers_a_minute"], now["end_lag_p50_ms"], rec["end_lag_p50_ms"]
         ),
-        json!({ "blinks": spans.len(), "blinks_text_still_there": ocr_miss.len(), "blink_p95_text_still_there_ms": p95_miss, "ends": ends.len(), "lines_shown": shown, "gone_lines": gone.len(), "table": table }),
+        json!({ "blinks": spans.len(), "blinks_text_still_there": ocr_miss.len(), "blink_p95_text_still_there_ms": p95_miss, "ends": ends.len(), "lines_shown": shown, "gone_lines": gone.len(), "pass_ms": r1(r), "table": table }),
         "جلسة لعب بالقيمة المقترحة، ثم أقارن الوميض وتأخر الاختفاء. والحكم الأخير لعينك على التلفزيون.".into(),
     )
+}
+
+/// "n passes" in Arabic, its noun as the number wants it.
+fn passes_ar(n: f64) -> String {
+    match n as u64 {
+        0 => "لا دورة".into(),
+        1 => "دورة واحدة".into(),
+        2 => "دورتين".into(),
+        k @ 3..=10 => format!("{k} دورات"),
+        k => format!("{k} دورة"),
+    }
 }
 
 fn fmt_time(unix_ms: u64, o: &Options) -> String {
@@ -1232,5 +1278,67 @@ mod tests {
         assert!(ca["value"].is_null());
         let st = r["advice"].as_array().unwrap().iter().find(|a| a["setting"] == "stable_ms").unwrap();
         assert_eq!(st["confidence"], "insufficient");
+    }
+
+    fn rec<'a>(r: &'a Value, setting: &str) -> &'a Value {
+        r["advice"].as_array().unwrap().iter().find(|a| a["setting"] == setting).unwrap()
+    }
+    fn row<'a>(a: &'a Value, key: &str, v: f64) -> &'a Value {
+        a["evidence"]["table"].as_array().unwrap().iter().find(|r| r[key].as_f64() == Some(v)).unwrap_or_else(|| panic!("no {key} {v}: {a}"))
+    }
+
+    #[test]
+    fn fork_advise_clear_after_works_in_steps_of_the_reading_passes() {
+        // ten 1-frame blinks (a pass apart: 100 ms on a 10-a-second capture) in 40 lines, Clear after 70
+        let r = analyze(&session(40, 4, 1, 70), &Options::default());
+        let ca = rec(&r, "clear_after_ms");
+        assert_eq!(ca["evidence"]["pass_ms"].as_f64(), Some(100.0), "{ca}");
+        // anything under 100 hides the line at the blink's pass: 50 and 70 alike
+        assert_eq!(row(ca, "clear_after_ms", 50.0)["flickers"], 10.0);
+        assert_eq!(row(ca, "clear_after_ms", 70.0)["flickers"], 10.0);
+        // 110 to 190 keeps it up, and hides it a whole pass (100 ms) later after its English, not 60 or 120
+        let lag = |v: f64| row(ca, "clear_after_ms", v)["end_lag_p50_ms"].as_f64().unwrap();
+        assert_eq!(row(ca, "clear_after_ms", 130.0)["flickers"], 0.0);
+        assert_eq!(lag(130.0) - lag(70.0), 100.0);
+        assert_eq!(lag(190.0) - lag(70.0), 100.0);
+        // 300 is three passes: 300 ms later than 70 (not the 230 of a model without the passes)
+        assert_eq!(lag(300.0) - lag(70.0), 300.0);
+        // advised: the middle of the best step (10 flickers cost more than 100 ms over 40 lines)
+        assert_eq!(ca["value"].as_f64(), Some(150.0), "{ca}");
+
+        // the same blinks over 120 lines: 100 ms a line costs more than 5 flickers, the step in use is best;
+        // 70 is clear of the step's edges: kept
+        let r = analyze(&session(120, 24, 1, 70), &Options::default());
+        assert_eq!(rec(&r, "clear_after_ms")["value"].as_f64(), Some(70.0), "{}", rec(&r, "clear_after_ms"));
+        // 100 is right on an edge (the pass at 100 ± a few ms decides): the step's middle instead
+        let r = analyze(&session(120, 24, 1, 100), &Options::default());
+        assert_eq!(rec(&r, "clear_after_ms")["value"].as_f64(), Some(50.0), "{}", rec(&r, "clear_after_ms"));
+    }
+
+    #[test]
+    fn fork_advise_stability_works_in_steps_of_the_reading_passes() {
+        // 10 a second (100 ms a pass); new lines the memory doesn't know staying 2 passes, and misreadings
+        // staying 2 passes before the line the memory knows
+        let mut ev = session(30, 0, 0, 70);
+        let base = 1_800_000_000_000u64 + 200_000;
+        for i in 0..6u64 {
+            let t0 = base + i * 4000;
+            ev.push(json!({ "ev": "seen", "t": t0, "area": "subtitles", "text": format!("Strangers: Brand new line {i}."), "known": false, "sure": true }));
+            ev.push(json!({ "ev": "ended", "t": t0 + 200, "area": "subtitles", "seq": 100 + i, "how": "gone" }));
+            let t1 = t0 + 2000;
+            ev.push(json!({ "ev": "seen", "t": t1, "area": "subtitles", "text": format!("Jasom: Lime numbor {i} of tha test."), "known": false, "sure": true }));
+            ev.push(json!({ "ev": "seen", "t": t1 + 200, "area": "subtitles", "text": format!("Jason: Line number {i} of the test."), "known": true, "sure": true }));
+        }
+        ev.sort_by_key(t);
+        let r = analyze(&ev, &Options::default());
+        let st = rec(&r, "stable_ms");
+        // 0 and 50: sent at the second reading (both stayed for it): 6 new lines on time, 6 misreadings shown
+        for v in [0.0, 50.0] {
+            assert_eq!((row(st, "stable_ms", v)["premature"].as_u64(), row(st, "stable_ms", v)["lost"].as_u64()), (Some(6), Some(0)), "{st}");
+        }
+        // 100: still the second reading (100 ms is one pass); 150: the third, which none of them stayed for
+        assert_eq!(row(st, "stable_ms", 100.0)["passes_sure"].as_f64(), Some(1.0));
+        assert_eq!(row(st, "stable_ms", 150.0)["passes_sure"].as_f64(), Some(2.0));
+        assert_eq!((row(st, "stable_ms", 150.0)["premature"].as_u64(), row(st, "stable_ms", 150.0)["lost"].as_u64()), (Some(0), Some(6)), "{st}");
     }
 }
