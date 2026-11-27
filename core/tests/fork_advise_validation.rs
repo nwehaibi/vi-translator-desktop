@@ -225,10 +225,12 @@ fn run(dir: &std::path::Path, script: &[Line], set: &Setup) -> Run {
         let captured = linelog::unix_ms();
         linelog::note_frame(*seq, captured);
         *said.lock().unwrap() = read.map(str::to_string);
+        // (the moment the frame is handed to the reader: the Arabic can be up before the pass returns — the
+        // presenter is a thread of its own — so a line's way to the screen is counted from here)
         let s0 = Instant::now();
         let _ = reader.step(Input::Frame(&f, &ocr));
         step_us.push(s0.elapsed().as_secs_f64() * 1e6);
-        (captured, Instant::now())
+        (captured, s0)
     };
     for _ in 0..10 {
         tick(None, None, &mut seq);
@@ -339,9 +341,25 @@ fn fork_the_analyzers_model_holds_against_the_reader() {
         }
         out
     };
+    // (medians: a stall of the machine's own in one line isn't the log's)
+    let quart = |v: &[f64], q: f64| {
+        let mut v = v.to_vec();
+        v.sort_by(|a, b| a.total_cmp(b));
+        v.get(((v.len() as f64 - 1.0) * q).round() as usize).copied().unwrap_or(f64::NAN)
+    };
+    let median = |v: &[f64]| quart(v, 0.5);
     let (on_step, off_step) = (mean(&a.step_us), mean(&c.step_us));
-    let (on_lat, off_lat) = (mean(&latency(&a)), mean(&latency(&c)));
-    eprintln!("a reading pass: {off_step:.0} µs with the log off, {on_step:.0} µs on (+{:.0} µs); a line to the screen: {off_lat:.1} ms off, {on_lat:.1} ms on", on_step - off_step);
+    let (lat_a, lat_c) = (latency(&a), latency(&c));
+    assert_eq!((lat_a.len(), lat_c.len()), (a.up_at.len(), c.up_at.len()), "every line shown, log on and off");
+    let (on_lat, off_lat) = (median(&lat_a), median(&lat_c));
+    eprintln!(
+        "a reading pass: {off_step:.0} µs with the log off, {on_step:.0} µs on (+{:.0} µs); a line to the screen (from its first frame handed to the reader, median [quartiles]): {off_lat:.1} [{:.1}–{:.1}] ms off, {on_lat:.1} [{:.1}–{:.1}] ms on",
+        on_step - off_step,
+        quart(&lat_c, 0.25),
+        quart(&lat_c, 0.75),
+        quart(&lat_a, 0.25),
+        quart(&lat_a, 0.75)
+    );
     // (the pass here reads a made-up frame in no time: the log's own work stands out the most here)
     assert!(on_step - off_step < 2000.0, "the log adds under 2 ms a pass");
     assert!(on_lat - off_lat < 15.0, "a line reaches the screen as fast with the log on");
