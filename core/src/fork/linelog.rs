@@ -90,6 +90,7 @@ fn refresh(s: &Sinks) {
     *READS.lock().unwrap() = None;
     super::timeline::reset();
     SOURCE_BAD_LAST.store(u64::MAX, Ordering::Relaxed);
+    SOURCE_BAD_TOLD.store(false, Ordering::Relaxed);
 }
 
 /// Write the log in the folder `dir` (None: stop writing it): a new session's file, going on in further
@@ -338,6 +339,7 @@ pub fn note_source_bad_frames(total: u64) {
     if prev != u64::MAX && total > prev {
         SOURCE_BAD_NEW.fetch_add(total - prev, Ordering::Relaxed);
     }
+    SOURCE_BAD_TOLD.store(true, Ordering::Relaxed);
 }
 
 /// Making a preview frame (shrinking it, or encoding it as JPEG) took `d`.
@@ -447,6 +449,8 @@ static SOURCE_CPU_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// grew by since the last second's readings)
 static SOURCE_BAD_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 static SOURCE_BAD_NEW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// (the source told its count this second: it counts its bad frames — whether its CPU can be told or not)
+static SOURCE_BAD_TOLD: AtomicBool = AtomicBool::new(false);
 static FRAME_W: AtomicU32 = AtomicU32::new(0);
 static FRAME_H: AtomicU32 = AtomicU32::new(0);
 
@@ -498,6 +502,7 @@ fn with_reads(f: impl FnOnce(&mut Reads)) {
             PREVIEW_US.store(0, Ordering::Relaxed);
             SOURCE_CPU_US.store(0, Ordering::Relaxed);
             SOURCE_BAD_NEW.store(0, Ordering::Relaxed);
+            SOURCE_BAD_TOLD.store(false, Ordering::Relaxed);
             SELF_TIME.with(|s| s.set(Duration::ZERO));
             now
         });
@@ -525,8 +530,10 @@ fn with_reads(f: impl FnOnce(&mut Reads)) {
         let avg = |(n, t): (u32, f64)| (n > 0).then(|| round1(t / f64::from(n)));
         let thread_cpu = super::cpu::thread_ms();
         let log_ms = SELF_TIME.with(|s| s.replace(Duration::ZERO)).as_secs_f64() * 1000.0;
-        // (1.5.0) a source with a thread of its own (the app's Xbox player) told its CPU this second
+        // (1.5.0) a source with a thread of its own (the app's Xbox player) told its CPU this second (where a
+        // thread's CPU can be told: Windows, Linux); and, apart from that, its count of bad frames
         let source_cpu = SOURCE_CPU_US.load(Ordering::Relaxed) > 0;
+        let source_counts = SOURCE_BAD_TOLD.swap(false, Ordering::Relaxed);
         let ev = json!({
             "n": r.n, "ocr_avg": round1(r.total / f64::from(r.n.max(1))), "ocr_max": round1(r.max),
             "pass_n": r.passes, "pass_avg": round1(r.pass_total / f64::from(r.passes.max(1))), "pass_max": round1(r.pass_max),
@@ -542,7 +549,7 @@ fn with_reads(f: impl FnOnce(&mut Reads)) {
             // (1.5.0) the source's own thread (the app's Xbox player decoding the stream): its CPU this second
             // (ms), and the frames it couldn't decode this second
             "source_cpu_ms": source_cpu.then_some(round1(SOURCE_CPU_US.swap(0, Ordering::Relaxed) as f64 / 1000.0)),
-            "bad_frames": source_cpu.then_some(SOURCE_BAD_NEW.swap(0, Ordering::Relaxed)),
+            "bad_frames": source_counts.then_some(SOURCE_BAD_NEW.swap(0, Ordering::Relaxed)),
             // (v2) a pass's frame: its age when the pass began, the wait since the pass before, passes on an old frame
             "age_ms": avg(r.age), "idle_ms": avg(r.idle), "same_frame": r.same_frame,
             "done_ms": r.done.iter().map(|(a, v)| (a.clone(), json!(avg(*v)))).collect::<serde_json::Map<String, Value>>(),
@@ -824,8 +831,21 @@ mod tests {
             read_sample("subtitles", 30.0);
         });
         let r = v.iter().find(|e| e["ev"] == "reads").expect("a second's readings");
-        assert!(r["source_cpu_ms"].as_f64().is_some_and(|ms| ms > 100.0), "{r}");
+        // (where a thread's own CPU can't be told — macOS here — none is said; the bad frames still are)
+        if super::super::cpu::thread_ms().is_some() {
+            assert!(r["source_cpu_ms"].as_f64().is_some_and(|ms| ms > 100.0), "{r}");
+        } else {
+            assert!(r["source_cpu_ms"].is_null(), "{r}");
+        }
         assert_eq!(r["bad_frames"].as_u64(), Some(2), "{r}");
+        // (a second in which the source told nothing — it stopped, another source — says no bad frames)
+        let (_, v) = collect(|| {
+            read_sample("subtitles", 30.0);
+            std::thread::sleep(Duration::from_millis(1050));
+            read_sample("subtitles", 30.0);
+        });
+        let r = v.iter().find(|e| e["ev"] == "reads").expect("a second's readings");
+        assert!(r["bad_frames"].is_null() && r["source_cpu_ms"].is_null(), "{r}");
     }
 
     #[test]
