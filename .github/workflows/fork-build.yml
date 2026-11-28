@@ -1,0 +1,112 @@
+# fork: the Xbox copy's own build (see FORK.md). Windows x64 only; the guard and the tests first (as the
+# original's release runs them), then the app. Run:
+# - on every push to a working branch (claude/…), before anything is merged into main: a push runs the
+#   workflow as it is on the branch pushed (GitHub: "This includes workflows that are not merged into the
+#   default branch"); documentation-only pushes don't;
+# - by hand: Actions → "Fork build (Windows x64)" → Run workflow — that button is there once this file is
+#   on the default branch; before that, a run that has happened once can be started again on its branch
+#   with GitHub's API or CLI (gh workflow run fork-build.yml --ref <branch>).
+# Two build artifacts:
+# - vi-translator-xbox-windows-x64: the executable, unsigned (for your own use: no release, no update
+#   signature; this copy's updates are installed by hand) and its SHA-256;
+# - vi-translator-xbox-measurement-tools: the memory-equivalence tool built from the original's core and
+#   from this copy's, and memory-check.cmd to compare them on your own translation memory (it stays on
+#   your PC); and the measurement log's analyzer (fork_advise.exe: advice on the five timing settings).
+# The app's version stays the original's it is based on (downloaded page scripts check it).
+name: Fork build (Windows x64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tests:
+        description: "Run the tests first"
+        type: boolean
+        default: true
+  push:
+    branches: ["claude/**"]
+    paths-ignore: ["**.md", "NOTICE", "LICENSE", ".fork/tests/**"]
+
+permissions:
+  contents: read
+
+# (a push while a build runs waits for it, the newest waiting one only: a running build is never cut short)
+concurrency:
+  group: fork-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      # (with chiaki-ng and Mbed TLS, as the original's release: the PS5's remote play is built from
+      # their sources; all the history: the original version it's based on)
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: The original's files unchanged
+        run: bash .fork/guard.sh
+
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "$TARGET"
+
+      # (the app and its core: the workspace's default members, as the original's release tests them)
+      # (a push always tests; by hand, as chosen)
+      - name: Test
+        if: github.event_name != 'workflow_dispatch' || inputs.tests
+        run: cargo test --target "$TARGET"
+
+      - name: Build
+        working-directory: src-tauri
+        run: cargo build --release --target "$TARGET"
+
+      - name: The executable
+        run: |
+          set -euo pipefail
+          mkdir -p out/app
+          sha="$(git rev-parse --short HEAD)"
+          cp "target/$TARGET/release/vi-translator.exe" "out/app/vi-translator-xbox-windows-x64-$sha.exe"
+          (cd out/app && sha256sum ./*.exe > SHA256SUMS.txt && cat SHA256SUMS.txt)
+
+      # (the tool builds from the same file in both: it uses only what the original's core has)
+      - name: The measurement tools
+        run: |
+          set -euo pipefail
+          mkdir -p out/tools
+          base="$(tr -d '[:space:]' < .fork/base-commit)"
+          cargo build --release --target "$TARGET" -p vi-translator-core --example fork_memory_equivalence --example fork_advise
+          cp "target/$TARGET/release/examples/fork_memory_equivalence.exe" out/tools/fork_memory_equivalence-fork.exe
+          cp "target/$TARGET/release/examples/fork_advise.exe" out/tools/fork_advise.exe
+          git worktree add --detach ../vit-base "$base"
+          mkdir -p ../vit-base/core/examples
+          cp core/examples/fork_memory_equivalence.rs ../vit-base/core/examples/
+          (cd ../vit-base && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --release --target "$TARGET" -p vi-translator-core --example fork_memory_equivalence)
+          cp "target/$TARGET/release/examples/fork_memory_equivalence.exe" out/tools/fork_memory_equivalence-original.exe
+          cp .fork/memory-check.cmd .fork/sweep-plan.example.json out/tools/
+          printf 'original: %s\nfork: %s\n' "$base" "$(git rev-parse HEAD)" > out/tools/VERSIONS.txt
+          ls -l out/tools
+
+      # (a push's builds are kept two weeks, a build asked for by hand a month: the storage is limited)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vi-translator-xbox-windows-x64
+          path: out/app/*
+          if-no-files-found: error
+          retention-days: ${{ github.event_name == 'push' && 14 || 30 }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vi-translator-xbox-measurement-tools
+          path: out/tools/*
+          if-no-files-found: error
+          retention-days: ${{ github.event_name == 'push' && 14 || 30 }}

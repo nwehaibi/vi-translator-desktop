@@ -1,0 +1,95 @@
+# fork: the Xbox copy's checks on every push (see FORK.md): what it never changes in the original app
+# (.fork/guard.sh), the core's tests (the original's and the copy's), and the translation memory
+# answering exactly as the original's does (the same synthetic memory and download loaded by the
+# original's core and by this copy's: every answer compared).
+name: Fork guard
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-guard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      # (all the history: the original version it's based on, .fork/base-commit)
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: The original's files unchanged
+        run: bash .fork/guard.sh
+
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: The core's tests
+        run: cargo test -p vi-translator-core
+
+      # (the tool builds from the same file in both: it uses only what the original's core has)
+      - name: The translation memory answers as the original's
+        run: |
+          set -euo pipefail
+          base="$(tr -d '[:space:]' < .fork/base-commit)"
+          git worktree add --detach ../vit-base "$base"
+          mkdir -p ../vit-base/core/examples
+          cp core/examples/fork_memory_equivalence.rs ../vit-base/core/examples/
+          tool() { cargo run -q -p vi-translator-core --example fork_memory_equivalence -- "$@"; }
+          tool sample "$RUNNER_TEMP/memeq"
+          (cd ../vit-base && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo run -q -p vi-translator-core --example fork_memory_equivalence -- \
+            dump --db "$RUNNER_TEMP/memeq/db" --pack-jsonl "$RUNNER_TEMP/memeq/pack.jsonl" --out "$RUNNER_TEMP/memeq/original.jsonl")
+          tool dump --db "$RUNNER_TEMP/memeq/db" --pack-jsonl "$RUNNER_TEMP/memeq/pack.jsonl" --out "$RUNNER_TEMP/memeq/fork.jsonl"
+          tool compare "$RUNNER_TEMP/memeq/original.jsonl" "$RUNNER_TEMP/memeq/fork.jsonl"
+
+      # (where the original's approximate lookup itself differs from run to run — lines as close, more
+      # than the 600 candidates it compares — the lines the memory has, the counts and what the memory
+      # file keeps must still be the same: compare's exit 0 or 1, never 2)
+      - name: The memory the same where approximate lookups vary
+        run: |
+          set -euo pipefail
+          tool() { cargo run -q -p vi-translator-core --example fork_memory_equivalence -- "$@"; }
+          tool sample-ties "$RUNNER_TEMP/ties"
+          (cd ../vit-base && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo run -q -p vi-translator-core --example fork_memory_equivalence -- \
+            dump --db "$RUNNER_TEMP/ties/db" --out "$RUNNER_TEMP/ties/original.jsonl")
+          tool dump --db "$RUNNER_TEMP/ties/db" --out "$RUNNER_TEMP/ties/fork.jsonl"
+          set +e
+          tool compare "$RUNNER_TEMP/ties/original.jsonl" "$RUNNER_TEMP/ties/fork.jsonl"
+          code=$?
+          set -e
+          if [ "$code" -ge 2 ]; then echo "::error::the lines the memory has, the counts or the memory file differ"; exit 1; fi
+
+      # (the upstream sync's merge, as the weekly workflow runs it, against made-up updates of the original:
+      # merged with the base moved on and the guard passing, a conflict reported, a workflow change waiting
+      # for its token, a timing default flagged; local copies only)
+      - name: The upstream sync merges as it should
+        run: bash .fork/tests/sync-dry-run.sh
+
+      # (the measurement log's analyzer against the reader itself: made-up sessions of known truth read by the
+      # app's own reader at two Clear after values and at two Text stability values, the analyzer's model of
+      # the one predicting the other, and the log's own cost — real time, about four minutes; see
+      # core/tests/fork_advise_validation.rs)
+      - name: The analyzer's model holds against the reader
+        run: cargo test -q --release -p vi-translator-core --test fork_advise_validation -- --ignored --nocapture
+
+      # (the measurement tools in the window of a release build — the original shows its Debugging section
+      # in development builds only: the real window in Chromium, the app's commands answered by a stand-in,
+      # a release and a development build, English and Arabic)
+      - name: The measurement tools are in the window of a release build
+        run: |
+          set -euo pipefail
+          cargo run -q -p vi-translator-core --example fork_window_fixture > "$RUNNER_TEMP/window-fixture.json"
+          mkdir -p "$RUNNER_TEMP/pw"
+          (cd "$RUNNER_TEMP/pw" && npm init -y > /dev/null && npm install --no-audit --no-fund --silent playwright@1.63.0 && npx playwright install --with-deps chromium > /dev/null)
+          NODE_PATH="$RUNNER_TEMP/pw/node_modules" node .fork/tests/ui-release.cjs "$RUNNER_TEMP/window-fixture.json"

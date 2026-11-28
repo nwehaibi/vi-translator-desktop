@@ -255,6 +255,7 @@ impl GraphicsCaptureApiHandler for Handler {
     }
 
     fn on_frame_arrived(&mut self, frame: &mut Frame, _control: InternalCaptureControl) -> Result<(), Self::Error> {
+        vi_translator_core::fork::linelog::note_arrived(); // fork: measurement log (every frame the source sends)
         // Full frames (a 4K frame is ~33 MB) only at the capture rate — plenty for reading text;
         // small preview frames at the (higher) preview rate, while the preview is watched.
         let full = self.shared.full_due(self.last);
@@ -262,6 +263,7 @@ impl GraphicsCaptureApiHandler for Handler {
         if !full && !preview {
             return Ok(());
         }
+        let fork_t0 = Instant::now(); // fork: measurement log (what taking a frame costs)
         let mut buf = frame.buffer_without_title_bar()?;
         let (w, h) = (buf.width(), buf.height());
         if let Some(white) = self.hdr {
@@ -282,11 +284,13 @@ impl GraphicsCaptureApiHandler for Handler {
             self.last_preview = Instant::now();
             let pitch = buf.row_pitch() as usize;
             self.shared.put_preview(shrink(buf.as_raw_buffer(), w, h, pitch, false));
+            vi_translator_core::fork::linelog::note_preview_cost(self.last_preview.elapsed()); // fork: measurement log
         }
         if full {
             self.last = Instant::now();
             let rgba = buf.as_nopadding_buffer(&mut self.scratch).to_vec();
             self.shared.put_full(w, h, rgba);
+            vi_translator_core::fork::linelog::note_copy_cost(fork_t0.elapsed()); // fork: measurement log
         }
         Ok(())
     }

@@ -229,7 +229,10 @@ pub fn start(name: String, port: u16, password: String, shared: Arc<Shared>) -> 
                 continue;
             };
             match o.preview_jpeg(&name2) {
-                Ok(j) => shared2.put_preview_jpeg(j),
+                Ok(j) => {
+                    vi_translator_core::fork::linelog::note_preview(); // fork: measurement log (OBS sends its preview ready-made)
+                    shared2.put_preview_jpeg(j)
+                }
                 Err(_) => obs = None, // reconnect next time
             }
         }

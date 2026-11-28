@@ -1,0 +1,18 @@
+VI Translator — Xbox fork
+=========================
+
+This is a modified version of VI Translator (https://github.com/vi-translator/vi-translator-desktop),
+licensed under the GNU Affero General Public License, version 3 only (see LICENSE). The modifications
+are listed in FORK.md: new files, and short hooks in the original's files marked "fork:".
+
+Ideas adapted from GameTranslator
+---------------------------------
+
+GameTranslator (https://github.com/nwehaibi/GameTranslator-Reference, branch "oyun-profilleri", at
+commit 1c72c6a), licensed under the GNU Affero General Public License, version 3.
+
+Adapted as ideas, re-implemented in this project's own code (no source code copied):
+- a per-line measurement log of each subtitle line's way and timing (its line metrics and subtitle
+  log): here core/src/fork/linelog.rs, with this project's own events and loss reasons.
+
+Anything adapted from it later is listed here, with what was adapted and where.

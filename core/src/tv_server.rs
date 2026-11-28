@@ -94,14 +94,21 @@ pub fn route(req: &Request, s: TcpStream, cfg: &Mutex<Config>, live: &Live, serv
     let (path, query) = (req.path.as_str(), req.query.as_str());
     match path {
         // the TV app's page: the overlays over the whole picture, for a connected TV only (its key in t=)
-        "/tv" | "/tv.json" | "/tv/forget" if !live.tvs.allowed(param(query, "t")) => respond(s, "403 Forbidden", "text/plain", b"not connected"),
+        // fork: (and /tv/drawn, the TV page telling it drew a state: the measurement log's)
+        "/tv" | "/tv.json" | "/tv/forget" | "/tv/drawn" if !live.tvs.allowed(param(query, "t")) => respond(s, "403 Forbidden", "text/plain", b"not connected"),
         "/tv" => {
             live.tvs.touch(param(query, "t"));
             serve(s, "tv.html")
         }
         "/tv.json" => {
             live.tvs.touch(param(query, "t"));
-            tv_state(cfg, live, s, param(query, "t"), param(query, "h"))
+            // fork: which TV it is answered for (measurement log)
+            crate::fork::tv_timing::for_tv(param(query, "t"), || tv_state(cfg, live, s, param(query, "t"), param(query, "h")))
+        }
+        // fork: the TV page drew a state (measurement log, while it's on)
+        "/tv/drawn" => {
+            crate::fork::tv_timing::drawn(param(query, "t"), param(query, "h"), crate::fork::tv_timing::number(param(query, "draw")));
+            respond(s, "200 OK", "text/plain", b"ok")
         }
         // the TV disconnected itself: its key is forgotten
         "/tv/forget" => {
@@ -148,11 +155,13 @@ pub fn tv_state(cfg: &Mutex<Config>, live: &Live, mut s: TcpStream, token: &str,
         let version = format!("{:016x}", h.finish());
         if version != seen {
             let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nX-State: {version}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
-                body.len()
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nX-State: {version}\r\n{}Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
+                body.len(),
+                crate::fork::tv_timing::ack_header() // fork: the page answers back once drawn (measurement log)
             );
             let _ = s.set_nodelay(true);
             let _ = s.write_all(head.as_bytes()).and_then(|_| s.write_all(body.as_bytes()));
+            crate::fork::tv_timing::sent_now(&version, live); // fork: measurement log
             return;
         }
         if start.elapsed() >= Duration::from_secs(1) {
