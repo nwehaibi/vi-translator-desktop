@@ -7818,6 +7818,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-vision",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",

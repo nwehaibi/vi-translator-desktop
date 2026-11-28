@@ -1577,6 +1577,9 @@ fn test_image(path: &str, area_id: &str) -> anyhow::Result<()> {
 // ------------------------------------------------------------------------------------- main
 
 fn main() {
+    // fork: one TLS crypto provider for the whole process, before anything uses TLS (see FORK.md: the app's
+    // own Xbox player panicked without it as its WebRTC connection started)
+    fork_cmds::install_tls_provider();
     move_old_folders();
     let args: Vec<String> = std::env::args().collect();
     // fork: the measurement tools (--replay-video, --evaluate, --gold-draft; see FORK.md)

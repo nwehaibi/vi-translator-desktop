@@ -16,6 +16,9 @@ anyhow = "1.0.104"
 base64 = "0.23.1"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "bmp"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "rustls"] }
+# fork: to name the process's TLS crypto provider (fork_cmds::install_tls_provider; see FORK.md): the rustls
+# already built here for reqwest (aws-lc-rs) and webrtc's DTLS (ring), no new crate
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
 sha2 = "0.10"
