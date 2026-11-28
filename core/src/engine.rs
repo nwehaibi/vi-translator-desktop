@@ -520,6 +520,8 @@ fn set_cover(sink: &dyn Sink, live: &Live, area: &str, cover: Option<serde_json:
 fn present_loop(sink: Arc<dyn Sink>, rx: mpsc::Receiver<PMsg>, live: Arc<Live>) {
     let mut p = Presenter { follow: true, ..Presenter::default() };
     let mut events: HashMap<(String, u64), TranslationEvent> = HashMap::new();
+    // fork: what each area shows now and since when (only for the measurement log)
+    let mut fork_up: HashMap<String, (u64, Instant)> = HashMap::new();
     loop {
         let mut msgs = Vec::new();
         match rx.recv_timeout(Duration::from_millis(40)) {
@@ -533,8 +535,17 @@ fn present_loop(sink: Arc<dyn Sink>, rx: mpsc::Receiver<PMsg>, live: Arc<Live>) 
             match m {
                 PMsg::Ready { seq, en_start, ev, now } => {
                     if if now { p.ready_now(&ev.area, seq, en_start) } else { p.ready(&ev.area, seq, en_start) } {
+                        // fork: a translation still waiting to go up, replaced by this newer one (measurement log)
+                        if crate::fork::linelog::on() {
+                            for (a, old) in events.keys().filter(|(a, s)| *a == ev.area && *s != seq) {
+                                crate::fork::linelog::emit("replaced", serde_json::json!({ "area": a, "seq": old, "by": seq }));
+                            }
+                        }
                         events.retain(|(a, _), _| *a != ev.area); // keep only the newest waiting line
                         events.insert((ev.area.clone(), seq), ev);
+                    } else if crate::fork::linelog::on() {
+                        // fork: turned down: everything up was cleared (a page took over) after its line was read
+                        crate::fork::linelog::emit("dropped", serde_json::json!({ "area": ev.area, "seq": seq, "reason": "cleared" }));
                     }
                 }
                 PMsg::Ended { area, seq, at } => p.ended(&area, seq, at),
@@ -553,6 +564,14 @@ fn present_loop(sink: Arc<dyn Sink>, rx: mpsc::Receiver<PMsg>, live: Arc<Live>) 
             match act {
                 Act::Show { area, seq } => {
                     if let Some(ev) = events.remove(&(area.clone(), seq)) {
+                        // fork: measurement log (`late`: its English had gone before its translation went up)
+                        if crate::fork::linelog::on() {
+                            let now = Instant::now();
+                            let late = p.ended.get(&(area.clone(), seq)).is_some_and(|end| *end <= now);
+                            let fork_ar: String = ev.segments.iter().map(|(t, c)| if c.as_deref().is_some_and(|c| c.starts_with("icon:")) { "🎮" } else { t.as_str() }).collect();
+                            crate::fork::linelog::emit("shown", serde_json::json!({ "area": area, "seq": seq, "at": ev.at, "en": crate::fork::linelog::excerpt(&ev.en), "late": late, "ar": crate::fork::linelog::excerpt(fork_ar.trim()) }));
+                            fork_up.insert(area.clone(), (seq, now));
+                        }
                         // (the text seen there is this line, or one before it: its translation is up now)
                         let cover_seq = live.covers.lock().unwrap().get(&area).map(|c| c["seq"].as_u64().unwrap_or(0));
                         if cover_seq.is_some_and(|s| s != 0 && s <= seq) {
@@ -570,6 +589,10 @@ fn present_loop(sink: Arc<dyn Sink>, rx: mpsc::Receiver<PMsg>, live: Arc<Live>) 
                     }
                 }
                 Act::Hide { area } => {
+                    // fork: measurement log
+                    if let Some((seq, since)) = fork_up.remove(&area).filter(|_| crate::fork::linelog::on()) {
+                        crate::fork::linelog::emit("hidden", serde_json::json!({ "area": area, "seq": seq, "shown_ms": since.elapsed().as_millis() as u64 }));
+                    }
                     live.on_screen.lock().unwrap().remove(&area);
                     live.shown.lock().unwrap().remove(&area);
                     let ev = TranslationEvent { area, en: String::new(), en_segments: Vec::new(), segments: Vec::new(), stats: String::new(), error: None, line_h: 0.0, text_box: None, game_box: None, cached: false, at: 0 };
@@ -899,8 +922,15 @@ impl Reader {
         }
         let c = ctx.cfg.lock().unwrap().clone();
         let t0 = Instant::now();
+        crate::fork::linelog::pass_start(); // fork: measurement log (the pass's parts: where its time goes)
         // (the player's, or the game's own: see Config::timing)
         let (interval_ms, stable_ms, clear_after_ms) = c.timing();
+        // fork: measurement log: the timing in use (written when it changes)
+        if crate::fork::linelog::on() {
+            let custom = c.timing_custom == Some(true);
+            let (capture_fps, preview_fps, picture_4k) = (c.capture_fps, c.preview_fps, c.picture_4k);
+            crate::fork::linelog::note_settings(crate::fork::linelog::Settings { capture_fps, preview_fps, picture_4k, interval_ms, stable_ms, clear_after_ms, custom });
+        }
         if c.target_lang != last_lang {
             // another language: everything shown and cached is in the old one
             last_lang = c.target_lang.clone();
@@ -925,6 +955,9 @@ impl Reader {
                 st.candidate_lines.clear();
             }
             let _ = present.send(PMsg::ClearAll { upto: seq_counter });
+            // fork: measurement log
+            crate::fork::linelog::emit("cleared", serde_json::json!({ "upto": seq_counter, "reason": "language" }));
+            crate::fork::timeline::cleared("language");
         }
         // pause-menu text the translator failed on: asked again when it's read again (every 30 s at most)
         if menu_retry_at.elapsed() >= Duration::from_secs(30) {
@@ -962,6 +995,7 @@ impl Reader {
             // another resolution: the text sizes are measured again
             sizes.at_resolution(fw, fh);
             if let (Some(frame), Some(ocr)) = (frame, ocr_now) {
+                crate::fork::linelog::stage("pages"); // fork: measurement log
                 // ---- game pages (the game's pages script finds and reads them; pagescript.rs) ----
                 // Appear: each page's `present` (cheap) every frame, then its `read`.
                 // Stay: `same` every frame — the translation stays exactly as long as the page does — with
@@ -1306,6 +1340,9 @@ impl Reader {
                             latest.lock().unwrap().insert(id.clone(), seq_counter);
                         }
                         let _ = present.send(PMsg::ClearAll { upto: seq_counter });
+                        // fork: measurement log
+                        crate::fork::linelog::emit("cleared", serde_json::json!({ "upto": seq_counter, "reason": "page", "page": layout.id }));
+                        crate::fork::timeline::cleared("page");
                     }
                     if screen.as_ref() != Some(&layout) {
                         let reason_changed = screen.as_ref().map(|s| s.reason_en != layout.reason_en).unwrap_or(true);
@@ -1334,6 +1371,10 @@ impl Reader {
                                 );
                             }
                         }
+                        // fork: measurement log (a page up, or another page in its place)
+                        if crate::fork::linelog::on() && screen.as_ref().is_none_or(|s| s.id != layout.id) {
+                            crate::fork::linelog::emit("page", serde_json::json!({ "id": layout.id, "on": true }));
+                        }
                         *ctx.live.screen.lock().unwrap() = serde_json::to_value(&layout).ok();
                         ctx.sink.emit("screen", serde_json::to_value(Some(&layout)).unwrap_or_default());
                         ctx.live.screen_active.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1346,6 +1387,8 @@ impl Reader {
                     let pause = screen.is_some();
                     let pace = if pause { (1000 / c.capture_fps.clamp(1, 60) as u64).min(interval_ms) } else { interval_ms };
                     let spent = t0.elapsed();
+                    crate::fork::timeline::pass_end(Some(frame.as_ref())); // fork: measurement log
+                    crate::fork::linelog::pass_sample(spent.as_secs_f64() * 1000.0); // fork: measurement log
                     // (normal areas pause while the page is up)
                     done!(Duration::from_millis(pace.max(30)).saturating_sub(spent));
                 }
@@ -1357,6 +1400,7 @@ impl Reader {
             // GTA VI's phone in the hand (WhatUp, Snapmatic): its text beside it (see phone.rs). Each piece
             // from the memory, or the translator (like a page's menu text: asked once, in the background,
             // shown when it comes); the contacts' names written as the speakers' are.
+            crate::fork::linelog::stage("phone"); // fork: measurement log
             if let (Some(f), Some(ocr)) = (frame, ocr_now) {
                 let found = if c.phone_text() {
                     crate::phone::find_screen(&f.rgba, f.w, f.h)
@@ -1627,6 +1671,7 @@ impl Reader {
                     None => {
                         // GTA VI's message bubble at the bottom right (see chat.rs): its translation in a
                         // bubble like it, above it. Read again only when its box changes.
+                        crate::fork::linelog::stage("chat"); // fork: measurement log
                         let chat = if c.phone_text() { crate::chat::find_bubble(&f.rgba, f.w, f.h) } else { None };
                         let bubble = chat.and_then(|r| {
                             let frac_r = screens::Rect { x: r.0 as f64 / f.w as f64, y: r.1 as f64 / f.h as f64, w: r.2 as f64 / f.w as f64, h: r.3 as f64 / f.h as f64 };
@@ -1740,6 +1785,7 @@ impl Reader {
                 }
                 keep
             });
+            crate::fork::linelog::stage("areas"); // fork: measurement log
             for area_cfg in c.areas.iter().filter(|a| a.enabled) {
                 // (an area whose lines stack up is read up to STACK_H above it too: see bottom_stack)
                 let stacks = c.fx(&area_cfg.id).stacks(&area_cfg.id);
@@ -1774,13 +1820,27 @@ impl Reader {
                         None => (None, Vec::new(), true),
                     },
                 };
+                // fork: measurement log (how long this area's read took; filters that leave text out)
+                let fork_on = crate::fork::linelog::on();
+                let fork_ocr_ms = now.elapsed().as_secs_f64() * 1000.0;
+                if fork_on && frame.is_some() {
+                    crate::fork::linelog::read_sample(&area.id, fork_ocr_ms);
+                }
                 let (mut text, mut words) = (ocr::clean(&words), words);
+                // fork: measurement log: words read, but too few letters for a line
+                if fork_on && text.is_empty() && !words.is_empty() {
+                    crate::fork::linelog::filtered(&area.id, "clean", &words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "));
+                }
                 // Subtitles are centred in the picture: text off-centre (a menu's "Browse" at the bottom
                 // right) is not a subtitle, and a panel at the side of the area (a garage's car stats) is
                 // left out of the line instead of pushing it off-centre.
                 if area.centered_only && !words.is_empty() {
                     let kept = ocr::centered_words(&words, area.x.clamp(0.0, 1.0) * fw as f64, fw as f64);
                     if kept.len() != words.len() {
+                        // fork: measurement log: none of it centred, so no subtitle
+                        if fork_on && kept.is_empty() {
+                            crate::fork::linelog::filtered(&area.id, "not_centered", &text);
+                        }
                         words = kept;
                         text = ocr::clean(&words);
                     }
@@ -1794,6 +1854,10 @@ impl Reader {
                     let moving = ocr::stack_moving(&words, cr.h as f64);
                     let all = std::mem::take(&mut words);
                     words = ocr::bottom_stack(&all, cr.h as f64);
+                    // fork: measurement log: text in the area, but no line where line 1 is
+                    if fork_on && words.is_empty() && !moving {
+                        crate::fork::linelog::filtered(&area.id, "no_bottom_line", &ocr::clean(&all));
+                    }
                     if words.is_empty() && moving && !st.current.is_empty() && st.last_seen.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(400)) {
                         continue;
                     }
@@ -1835,12 +1899,20 @@ impl Reader {
                             }
                         }
                         None => {
+                            // fork: measurement log: no text where the game's box always is
+                            if fork_on {
+                                crate::fork::linelog::filtered(&area.id, "help_anchor", &text);
+                            }
                             st.anchored_at = None;
                             text.clear();
                         }
                     }
                     // (a sign in capitals, or a shop menu's item where the box would be: not sentences)
                     if ocr::mostly_capitals(&text) || !ocr::reads_as_sentences(&text) {
+                        // fork: measurement log
+                        if fork_on {
+                            crate::fork::linelog::filtered(&area.id, "help_not_sentence", &text);
+                        }
                         text.clear();
                     }
                 } else if area.needs_box && !text.is_empty() {
@@ -1865,7 +1937,13 @@ impl Reader {
                                 text = ocr::clean(&words);
                             }
                         }
-                        None => text.clear(),
+                        None => {
+                            // fork: measurement log: no game box around the text
+                            if fork_on {
+                                crate::fork::linelog::filtered(&area.id, "help_anchor", &text);
+                            }
+                            text.clear()
+                        }
                     }
                     // (a sign or billboard with a frame around it: in capitals, not the game's sentences)
                     if ocr::mostly_capitals(&text) {
@@ -1874,7 +1952,16 @@ impl Reader {
                 }
                 // Not English at all (another script, icons, a map read as letters): no text here.
                 if !ocr::looks_like_words(&text) {
+                    // fork: measurement log
+                    if fork_on {
+                        crate::fork::linelog::filtered(&area.id, "not_words", &text);
+                    }
                     text.clear();
+                }
+                // fork: measurement log: this area's reading this pass (each line's timeline, the unread-text finder)
+                if fork_on {
+                    let fork_same = !text.is_empty() && same_text(&text, &lines_now, &st.current, &st.current_lines);
+                    crate::fork::timeline::area_read(&area.id, [area_cfg.x, area_cfg.y, area_cfg.w, area_cfg.h], area_cfg.centered_only, stacks, !text.is_empty(), fork_same, st.current_seq, frame.map(|f| f.seq));
                 }
                 if !text.is_empty() {
                     st.last_seen = Some(now);
@@ -1960,6 +2047,21 @@ impl Reader {
                                 parts.len() > 1 && parts.iter().all(|(p, _)| knows(p))
                             })
                         });
+                    // fork: measurement log: a new reading of this area (a line's first sighting, or a change), the
+                    // frame read before it (the English appeared between them) and the memory's verdict on it
+                    if fork_on && is_new {
+                        let fseq = frame.map(|f| f.seq);
+                        let (prev_captured, prev_text) = crate::fork::timeline::on_seen(&area.id);
+                        crate::fork::linelog::emit(
+                            "seen",
+                            serde_json::json!({
+                                "area": area.id, "text": crate::fork::linelog::excerpt(&st.candidate), "lines": st.candidate_lines.len(),
+                                "frame": fseq, "captured": fseq.and_then(crate::fork::linelog::captured_of),
+                                "ocr_ms": (fork_ocr_ms * 10.0).round() / 10.0, "sure": sure,
+                                "prev_captured": prev_captured, "prev_text": prev_text, "known": known,
+                            }),
+                        );
+                    }
                     // A reading the app isn't sure of (text still animating in: GTA VI's instructions
                     // fade in with a glow) waits three times as long: by then the real text has
                     // replaced it, or it really is what's on screen.
@@ -2017,6 +2119,10 @@ impl Reader {
                     // (a line not let through with its black box up — it went up for a reading that was: no empty box stays)
                     if !allowed && is_new && c.cover_look() {
                         set_cover(&*ctx.sink, &ctx.live, &area.id, None);
+                    }
+                    // fork: measurement log: a settled line that only reviewed translations may show, and none has it
+                    if fork_on && !allowed && (known || settled) && !same_text(&st.candidate, &st.candidate_lines, &st.current, &st.current_lines) {
+                        crate::fork::linelog::filtered(&area.id, "reviewed_only", &st.candidate);
                     }
                     if allowed && (((known || settled) && !same_text(&st.candidate, &st.candidate_lines, &st.current, &st.current_lines)) || recolor) {
                         // Stable new text: translate it once. Colours are measured now (and again for a
@@ -2124,6 +2230,20 @@ impl Reader {
                             _ => (text_box, game_box),
                         };
                         st.line_boxes = Some((text_box, game_box));
+                        // fork: measurement log: the line goes to the translator
+                        if fork_on {
+                            let fseq = frame.map(|f| f.seq);
+                            crate::fork::linelog::emit(
+                                "sent",
+                                serde_json::json!({
+                                    "area": area.id, "seq": seq_counter, "en": crate::fork::linelog::excerpt(&en),
+                                    "parts": parts.iter().map(|(t, _)| crate::fork::linelog::excerpt(t)).collect::<Vec<_>>(),
+                                    "at": crate::fork::linelog::at_ms(en_start), "frame": fseq,
+                                    "captured": fseq.and_then(crate::fork::linelog::captured_of), "recolor": recolor,
+                                    "appear_after": crate::fork::timeline::appear(&area.id).0, "appear_by": crate::fork::timeline::appear(&area.id).1,
+                                }),
+                            );
+                        }
                         let _ = jobs.send(Job { area: area.id.clone(), seq: seq_counter, en, phrases, icons, line_h, en_start, text_box, game_box, parts });
                     }
                 } else if !st.current.is_empty()
@@ -2157,6 +2277,8 @@ impl Reader {
         }
         let spent = t0.elapsed();
         perf_note(PerfKind::Read, spent.as_secs_f64() * 1000.0);
+        crate::fork::timeline::pass_end(frame.map(|f| f.as_ref())); // fork: measurement log
+        crate::fork::linelog::pass_sample(spent.as_secs_f64() * 1000.0); // fork: measurement log
         done!(Duration::from_millis(interval_ms.max(MIN_INTERVAL_MS)).saturating_sub(spent));
     }
 }
@@ -2199,6 +2321,10 @@ fn translate_loop(ctx: Context, latest: Arc<Mutex<HashMap<String, u64>>>, jobs: 
         // Skip text that was already replaced on screen while we were busy. (Pause-menu lines
         // aren't an area: each is translated once and kept, so never skip those.)
         if job.area != MENU_TEXT && latest.lock().unwrap().get(&job.area).copied() != Some(job.seq) {
+            // fork: measurement log: never translated, a newer line of its area came first
+            if crate::fork::linelog::on() && job.area != SCREEN_REASON {
+                crate::fork::linelog::emit("skipped", serde_json::json!({ "area": job.area, "seq": job.seq, "en": crate::fork::linelog::excerpt(&job.en), "reason": "superseded" }));
+            }
             continue;
         }
         let c = cfg.lock().unwrap().clone();
@@ -2239,6 +2365,25 @@ fn translate_loop(ctx: Context, latest: Arc<Mutex<HashMap<String, u64>>>, jobs: 
             translate_spoken(&mut tr, &c, &memory, &job.en, &job.icons, &job.phrases, &status)
         };
         perf_note(PerfKind::Translate, t_translate.elapsed().as_secs_f64() * 1000.0);
+        // fork: measurement log: the line's translation, and where it came from (each part's, for stacked lines)
+        if crate::fork::linelog::on() && job.area != MENU_TEXT && job.area != SCREEN_REASON {
+            let texts: Vec<&str> = if job.parts.len() > 1 { job.parts.iter().map(|(t, _)| t.as_str()).collect() } else { vec![job.en.as_str()] };
+            let sources: Vec<Option<String>> = {
+                let m = memory.lock().unwrap();
+                let found = |l: &str| m.get(l, &[], &[]).map(|(_, src)| src);
+                texts.iter().map(|t| found(t).or_else(|| speaker::without_name(t).and_then(found)).or_else(|| found(&speaker::sentence_of(t)))).collect()
+            };
+            let err = result.as_ref().err().map(|e| format!("{e:#}"));
+            crate::fork::linelog::emit(
+                "translated",
+                serde_json::json!({
+                    "area": job.area, "seq": job.seq, "ok": err.is_none(), "hit": hit,
+                    "ms": (t_translate.elapsed().as_secs_f64() * 10000.0).round() / 10.0, "sources": sources,
+                    "error_kind": err.as_deref().map(crate::fork::linelog::error_kind),
+                    "error": err.as_deref().map(crate::fork::linelog::excerpt),
+                }),
+            );
+        }
         let hit_from = if hit { "memory" } else { "" };
         // time from the English line appearing to its Arabic being ready
         let ready_ms = job.en_start.elapsed().as_secs_f64() * 1000.0;
@@ -2708,6 +2853,10 @@ fn localize_screen(l: &mut screens::ScreenLayout, cache: &HashMap<String, String
 
 /// Take the profile page down right away (the game's own page is gone).
 fn hide_screen(sink: &dyn Sink, shared: &Live, latest: &Mutex<HashMap<String, u64>>, screen: &mut Option<screens::ScreenLayout>) {
+    // fork: measurement log
+    if let Some(s) = screen.as_ref().filter(|_| crate::fork::linelog::on()) {
+        crate::fork::linelog::emit("page", serde_json::json!({ "id": s.id, "on": false }));
+    }
     *screen = None;
     // its reason may still be with the translator: translate_loop drops it when it comes
     latest.lock().unwrap().remove(SCREEN_REASON);

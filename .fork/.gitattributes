@@ -1,0 +1,3 @@
+# fork: Windows scripts with Windows line ends (cmd.exe finds its labels reliably only so), shell scripts with Unix ones
+*.cmd text eol=crlf
+*.sh text eol=lf

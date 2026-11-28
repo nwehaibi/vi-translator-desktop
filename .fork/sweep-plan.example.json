@@ -1,0 +1,28 @@
+{
+  "video": "calibration.mp4",
+  "gold": "calibration-gold.json",
+  "data": "frozen/data",
+  "db": "frozen/db",
+  "repeat": 2,
+  "cooldown_s": 45,
+  "tail_s": 5,
+  "base": {},
+  "runs": [
+    { "name": "current" },
+    { "name": "interval-33", "set": { "interval_ms": 33 } },
+    { "name": "interval-50", "set": { "interval_ms": 50 } },
+    { "name": "interval-100", "set": { "interval_ms": 100 } },
+    { "name": "interval-150", "set": { "interval_ms": 150 } },
+    { "name": "interval-250", "set": { "interval_ms": 250 } },
+    { "name": "capture-30", "set": { "capture_fps": 30 } },
+    { "name": "capture-15", "set": { "capture_fps": 15 } },
+    { "name": "capture-12", "set": { "capture_fps": 12 } },
+    { "name": "capture-8", "set": { "capture_fps": 8 } },
+    { "name": "stable-0", "set": { "stable_ms": 0 } },
+    { "name": "stable-200", "set": { "stable_ms": 200 } },
+    { "name": "stable-400", "set": { "stable_ms": 400 } },
+    { "name": "clear-300", "set": { "clear_after_ms": 300 } },
+    { "name": "clear-600", "set": { "clear_after_ms": 600 } },
+    { "name": "clear-1200", "set": { "clear_after_ms": 1200 } }
+  ]
+}

@@ -91,6 +91,7 @@
         let wait = 0;
         try {
           const r = await timed(fetch(`tv.json?t=${encodeURIComponent(key)}&h=${encodeURIComponent(version)}`, { cache: "no-store" }), 6000);
+          const arrived = performance.now(); // fork: (measurement log, below)
           alive();
           if (r.status === 200) {
             const next = await timed(r.json(), 6000);
@@ -102,6 +103,15 @@
             state = next;
             AS.setLang(state.lang);
             draw();
+            // fork: while the PC's measurement log is on, tell it once this state is painted (two animation
+            // frames after drawing), with how long that took here since the answer arrived
+            if (r.headers.get("X-Ack") === "1") {
+              const drawn = version;
+              requestAnimationFrame(() => requestAnimationFrame(() => {
+                const ms = Math.round(performance.now() - arrived);
+                fetch(`tv/drawn?t=${encodeURIComponent(key)}&h=${encodeURIComponent(drawn)}&draw=${ms}`, { cache: "no-store" }).catch(() => {});
+              }));
+            }
             if (restarted) location.reload();
           } else if (r.status !== 204) {
             // (sharing switched off, this TV removed in the app, or an older app without this page)

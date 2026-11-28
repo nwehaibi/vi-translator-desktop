@@ -226,10 +226,12 @@ impl Shared {
             None => (w, h, rgba),
         };
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        vi_translator_core::fork::linelog::note_captured(seq, w, h); // fork: measurement log
         *self.frame.lock().unwrap() = Some(Arc::new(FrameData { w, h, rgba, seq }));
     }
     /// Store a preview frame (small RGBA; the preview thread turns it into JPEG).
     pub fn put_preview(&self, f: FrameData) {
+        vi_translator_core::fork::linelog::note_preview(); // fork: measurement log
         let crop = *self.source_crop.lock().unwrap();
         let f = match crop {
             Some(c) => match crop_rgba(&f.rgba, f.w, f.h, c) {
@@ -243,11 +245,14 @@ impl Shared {
     /// Store a raw YUY2 preview frame (a capture card's own picture).
     #[cfg_attr(not(windows), allow(dead_code))] // (the Windows capture card reader's)
     pub fn put_preview_yuv(&self, f: YuvFrame) {
+        vi_translator_core::fork::linelog::note_preview(); // fork: measurement log
         let seq = self.preview_seq.fetch_add(1, Ordering::Relaxed) + 1;
         *self.preview_yuv.lock().unwrap() = Some((seq, Arc::new(f)));
     }
     /// Store a ready-made preview JPEG (OBS sends one).
     pub fn put_preview_jpeg(&self, jpeg: Vec<u8>) {
+        // (fork: not counted as a preview frame here: each JPEG is made from a preview frame counted when it
+        // came in — counted twice in the log's first version, its preview_fps double the real rate)
         let seq = self.preview_seq.fetch_add(1, Ordering::Relaxed) + 1;
         *self.preview_jpeg.lock().unwrap() = Some((seq, Arc::new(jpeg)));
     }
