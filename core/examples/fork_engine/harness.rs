@@ -250,14 +250,15 @@ fn script(name: &'static str, frame_ms: u64, custom: Option<(u64, u64, u64)>) ->
     m.extend(line("Jason: Line number 9 is on the screen", 16));
     known.push(("Jason: Line number 9 is on the screen".into(), false, true));
     m.extend(gap(5));
-    // 10., 11. and 11b.: lines straight after one another, no gap — 11 a digit away from 10 (the reader
-    // takes it for the same line read again), 11b another line altogether (it takes the place of the one up)
+    // 10. and 11.: one line straight after another, no gap — 11 a digit away from 10 (the reader takes it
+    // for the same line read again). (Not here: another line altogether straight after one up. The
+    // original's own reader then sometimes takes the line up down a moment before the next one goes up,
+    // sometimes not, by its threads' timing: its core run alone under load told it both ways, so it can't
+    // be compared exactly.)
     m.extend(line(&l(10), 16));
     m.extend(line(&l(11), 16));
-    m.extend(line("Locals: Another line straight after it", 16));
     known.push((l(10), true, true));
     known.push((l(11), true, true));
-    known.push(("Locals: Another line straight after it".into(), true, true));
     m.extend(gap(5));
     // 12. the last line, and the screen empty after it
     m.extend(line(&l(12), 16));
