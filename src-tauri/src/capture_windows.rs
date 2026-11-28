@@ -273,10 +273,12 @@ impl GraphicsCaptureApiHandler for Handler {
             if preview {
                 self.last_preview = Instant::now();
                 self.shared.put_preview(shrink(&rgba, w, h, w as usize * 4, false));
+                vi_translator_core::fork::linelog::note_preview_cost(self.last_preview.elapsed()); // fork: measurement log
             }
             if full {
                 self.last = Instant::now();
                 self.shared.put_full(w, h, rgba);
+                vi_translator_core::fork::linelog::note_copy_cost(fork_t0.elapsed()); // fork: measurement log (with the HDR picture brought to SDR)
             }
             return Ok(());
         }

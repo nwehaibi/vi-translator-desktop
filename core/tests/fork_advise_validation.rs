@@ -1,11 +1,13 @@
 //! fork: the log's measurements and the analyzer's model checked against the reader itself (see FORK.md).
 //!
-//! A made-up session the truth of which is known — lines up and gone at known frames, OCR blinks of 1, 3, 5
-//! and 8 frames while a line is up (its text still drawn: the unread-text finder sees it), read by the
-//! app's own reader at 20 frames a second — is played with Clear after at 70 ms and again at 230 ms:
+//! A made-up session the truth of which is known — lines up and gone at known frames, OCR blinks of 2, 4, 8
+//! and 12 frames while a line is up (its text still drawn: the unread-text finder sees it), read by the
+//! app's own reader at a frame every 45 ms — is played with Clear after at 70 ms and again at 430 ms. In
+//! 1.5.0 a subtitle's English counts as gone after 250 ms at the least (its dropout floor), so 70 does what
+//! 250 does: 5.6 passes of 45 ms, clear of the passes' edges (as 430 is: 9.6 passes):
 //! - the English's appearance the log tells (between two frames) holds each line's true first frame;
-//! - what the analyzer predicts from the 70 ms session for 230 ms (flickers; how much later the Arabic goes)
-//!   is what the 230 ms session does;
+//! - what the analyzer predicts from the 70 ms session for 430 ms (flickers; how much later the Arabic goes)
+//!   is what the 430 ms session does — the floor modelled: the 70 ms session's flickers are 250's;
 //! - the log costs the reading next to nothing: the same session with the log off and on, each reading's
 //!   time and each line's way to the screen compared.
 //!
@@ -29,7 +31,10 @@ use vi_translator_core::memory::Memory;
 use vi_translator_core::ocr::{Ocr, RawWord, TextEngine};
 use vi_translator_core::{Paths, Sink};
 
-const FRAME_MS: u64 = 50;
+const FRAME_MS: u64 = 45;
+
+/// 1.5.0's dropout floor (engine.rs DROPOUT_FLOOR_MS): a subtitle counts as gone after this at the least.
+const FLOOR_MS: u64 = 250;
 
 /// (the log's collector and the reader's timings are the process's own: one session at a time)
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
@@ -138,10 +143,17 @@ struct Line {
     known: bool,
 }
 
-/// The Clear after session: 16 lines the memory knows, 40 frames each, OCR blinks of 0–8 frames.
+/// The Clear after session: 32 lines the memory knows (lines enough for the analyzer's advice: 30 shown at
+/// the least), 30 frames each, OCR blinks of 0–12 frames in their middle (90 to 540 ms: under, between and
+/// over 250 and 430, none near their edges).
 fn script() -> Vec<Line> {
-    let blinks = [0u64, 1, 3, 5, 8, 0, 1, 3, 5, 8, 0, 3, 8, 1, 5, 0];
-    blinks.iter().enumerate().map(|(i, &b)| Line { en: format!("Tourists: Line number {i} is on the screen"), frames: 40, blink: b, misread: None, known: true }).collect()
+    let blinks = [0u64, 2, 4, 8, 12, 0, 2, 4, 8, 12, 0, 4, 12, 2, 8, 0];
+    blinks
+        .iter()
+        .chain(blinks.iter())
+        .enumerate()
+        .map(|(i, &b)| Line { en: format!("Tourists: Line number {i} is on the screen"), frames: 30, blink: b, misread: None, known: true })
+        .collect()
 }
 
 /// The Text stability session: in turn a line the memory knows misread for its first 2 frames, one misread
@@ -278,12 +290,13 @@ fn fork_the_analyzers_model_holds_against_the_reader() {
     let base = std::env::temp_dir().join(format!("vit-fork-advise-{}", std::process::id()));
     let o = advise::Options::default();
     let script = script();
-    let set = |clear_after: u64, log: bool| Setup { frame_ms: FRAME_MS, clear_after, stable: 0, log, between: 12 };
-    // flickers expected: a blink longer than Clear after hides the line (and it comes back)
-    let expect = |ca: u64| script.iter().filter(|l| l.blink > 0 && l.blink * FRAME_MS > ca).count() as u64;
-    // (Clear after B: in the middle of a pass step — 230 is 4.6 passes of 50 ms — where the passes' jitter
-    // can't move it; 300, a whole 6 passes, would go one way or the other)
-    const B: u64 = 230;
+    let set = |clear_after: u64, log: bool| Setup { frame_ms: FRAME_MS, clear_after, stable: 0, log, between: 10 };
+    // flickers expected: a blink longer than Clear after (the floor at the least) hides the line (and it
+    // comes back)
+    let expect = |ca: u64| script.iter().filter(|l| l.blink > 0 && l.blink * FRAME_MS > ca.max(FLOOR_MS)).count() as u64;
+    // (Clear after B: in the middle of a pass step — 430 is 9.6 passes of 45 ms — where the passes' jitter
+    // can't move it; and so is the floor that 70 does: 5.6)
+    const B: u64 = 430;
 
     let a = run(&base.join("a"), &script, &set(70, true));
     if let Some(dump) = std::env::var_os("FORK_DUMP") {
@@ -324,7 +337,9 @@ fn fork_the_analyzers_model_holds_against_the_reader() {
     assert_eq!(predicted, flickers(&rb));
     let (end_a, end_b) = (seg(&ra)["sync"]["end_here_ms"]["p50"].as_f64().unwrap(), seg(&rb)["sync"]["end_here_ms"]["p50"].as_f64().unwrap());
     let shift = end_b - end_a;
-    // (the passes' steps: 230 is 4 passes of 50 ms, 70 is 1 — 150 ms later, not the 160 of a model without them)
+    // (the passes' steps: 430 is 9 passes of 45 ms, 70 is the floor's 5 — 180 ms later, not the 360 of a
+    // model without the floor)
+    assert_eq!(row(70.0)["acts_as_ms"].as_f64(), Some(FLOOR_MS as f64), "70 does what the floor does");
     let predicted_shift = row(B as f64)["end_lag_p50_ms"].as_f64().unwrap() - row(70.0)["end_lag_p50_ms"].as_f64().unwrap();
     eprintln!("the Arabic's end after the English's: {end_a} ms at 70, {end_b} ms at {B} (predicted {predicted_shift:+.0}, measured {shift:+.0})");
     assert!((shift - predicted_shift).abs() <= 15.0, "predicted {predicted_shift}, measured {shift}");

@@ -356,10 +356,15 @@ fn lines_of(ev: &[Value], frame_ms: f64) -> Vec<Line> {
     };
     let tvs: Vec<&Value> = ev.iter().filter(|e| kind(e) == "tv_sent").collect();
     let tv_ts: Vec<u64> = tvs.iter().map(|e| t(e)).collect();
+    // (1.5.0: a TV switched off in the app is sent the overlays off — `off` — and draws nothing: a line up
+    // while it's off was never on it, and its going there is no line's end)
     for l in lines.iter_mut() {
         let Some(st) = l.shown_t else { continue };
         let from = tv_ts.partition_point(|&x| x + 5 < st);
         for e in tvs[from..].iter().take(200) {
+            if e["off"] == true {
+                break;
+            }
             if e["shown"][&l.area].as_u64() == Some(l.at) {
                 l.tv_on = drawn_for(e);
                 break;
@@ -369,7 +374,7 @@ fn lines_of(ev: &[Value], frame_ms: f64) -> Vec<Line> {
             let from = tv_ts.partition_point(|&x| x + 5 < dt);
             for e in tvs[from..].iter().take(200) {
                 if e["shown"][&l.area].as_u64() != Some(l.at) {
-                    l.tv_off = drawn_for(e);
+                    l.tv_off = if e["off"] == true { None } else { drawn_for(e) };
                     break;
                 }
             }
@@ -397,6 +402,10 @@ struct Seconds {
     idle_ms: Vec<f64>,
     same_frame: f64,
     reader_cpu: Vec<f64>,
+    /// (1.5.0) the source's own thread (the app's Xbox player decoding the stream): CPU ms a second, and
+    /// the frames it couldn't decode
+    source_cpu: Vec<f64>,
+    bad_frames: f64,
     log_ms: Vec<f64>,
     detect_ms: Vec<f64>,
     done: HashMap<String, Vec<f64>>,
@@ -428,6 +437,8 @@ fn seconds_of(ev: &[Value]) -> Seconds {
         x.idle_ms.extend(f(e, "idle_ms"));
         x.same_frame += f(e, "same_frame").unwrap_or(0.0);
         x.reader_cpu.extend(f(e, "reader_cpu_ms"));
+        x.source_cpu.extend(f(e, "source_cpu_ms"));
+        x.bad_frames += f(e, "bad_frames").unwrap_or(0.0);
         x.log_ms.extend(f(e, "log_ms"));
         x.detect_ms.extend(f(e, "detect_ms"));
         for (a, v) in e["done_ms"].as_object().into_iter().flatten() {
@@ -454,11 +465,23 @@ struct Timing {
     interval_ms: f64,
     stable_ms: f64,
     clear_after_ms: f64,
+    /// (1.5.0) the shortest time the reader lets the subtitles' English be missed before it counts as gone
+    /// (its dropout floor, 250 ms; 0 before 1.5.0): a Clear after below it does what it does
+    clear_floor_ms: f64,
 }
 
-fn timing_of(e: Option<&Value>) -> Timing {
+/// The version a log's app was ("1.5.0"), as (major, minor, patch).
+fn version_of(app: &str) -> (u32, u32, u32) {
+    let mut p = app.split('.').map(|x| x.trim().parse::<u32>().unwrap_or(0));
+    (p.next().unwrap_or(0), p.next().unwrap_or(0), p.next().unwrap_or(0))
+}
+
+fn timing_of(e: Option<&Value>, app: &str) -> Timing {
     let g = |k: &str, d: f64| e.and_then(|e| f(e, k)).unwrap_or(d);
-    Timing { capture_fps: g("capture_fps", 12.0), preview_fps: g("preview_fps", 60.0), interval_ms: g("interval_ms", 16.0), stable_ms: g("stable_ms", 0.0), clear_after_ms: g("clear_after_ms", 70.0) }
+    let clear_after_ms = g("clear_after_ms", 70.0);
+    // the floor as the log says it (1.5.0's settings event), else as its version has it
+    let clear_floor_ms = e.and_then(|e| f(e, "clear_floor_ms")).unwrap_or(if version_of(app) >= (1, 5, 0) { 250.0 } else { 0.0 });
+    Timing { capture_fps: g("capture_fps", 12.0), preview_fps: g("preview_fps", 60.0), interval_ms: g("interval_ms", 16.0), stable_ms: g("stable_ms", 0.0), clear_after_ms, clear_floor_ms }
 }
 
 /// A recommendation: the value, why, what it should do, how sure, and the test that confirms it.
@@ -656,6 +679,9 @@ fn analyze_segment(ev: &[Value], timing: Timing, cpus: Option<f64>, o: &Options)
         "subtitles_read_done_ms": sec.done.get("subtitles").map(|v| spread(v)),
         "frame_age_ms": spread(&sec.age_ms), "idle_before_pass_ms": spread(&sec.idle_ms), "passes_on_old_frame": sec.same_frame,
         "reader_cpu_ms_a_second": reader_cpu, "copy_ms_a_frame": mean(&sec.copy_ms),
+        // (1.5.0) the source's own thread: the app's Xbox player decoding the stream on the CPU (in this app's
+        // CPU — a window's source decodes in its own app, outside it)
+        "source_cpu_ms_a_second": mean(&sec.source_cpu), "bad_frames": sec.bad_frames,
         "preview_seconds": sec.preview_on, "preview_ms_a_frame": mean(&sec.preview_ms),
         "log_ms_a_second": mean(&sec.log_ms), "frame_sizes": sec.frame,
     });
@@ -822,7 +848,11 @@ fn analyze_segment(ev: &[Value], timing: Timing, cpus: Option<f64>, o: &Options)
 fn stability_advice(seen: &[&Value], ev: &[Value], timing: Timing, read_ms: f64, o: &Options) -> Value {
     // each reading: how long it stayed (until the next reading of the area, or the area went quiet), known
     // or not, sure or not; and whether it was the line's last reading (the real one) or a passing one
-    let ends: Vec<u64> = ev.iter().filter(|e| kind(e) == "ended" && s(e, "area") == "subtitles").map(t).collect();
+    let subs_ended = || ev.iter().filter(|e| kind(e) == "ended" && s(e, "area") == "subtitles");
+    // (the area gone quiet; and each sent line's own end, by its seq)
+    let gone_ends: Vec<u64> = subs_ended().filter(|e| s(e, "how") == "gone").map(t).collect();
+    let ended_of: HashMap<u64, u64> = subs_ended().filter_map(|e| Some((u(e, "seq")?, t(e)))).collect();
+    let sent: Vec<&Value> = ev.iter().filter(|e| kind(e) == "sent" && s(e, "area") == "subtitles").collect();
     let mut unknown: Vec<(f64, bool, bool)> = Vec::new(); // (stayed ms, sure, passing)
     let has_known = seen.iter().any(|e| e["known"].is_boolean());
     for (i, r) in seen.iter().enumerate() {
@@ -830,7 +860,15 @@ fn stability_advice(seen: &[&Value], ev: &[Value], timing: Timing, read_ms: f64,
             continue;
         }
         let next = seen.get(i + 1);
-        let end = ends.iter().copied().find(|&x| x > t(r));
+        // the reading's own end: the next reading of the area; or the area gone quiet (a line up `ended`
+        // "gone"); or, if it was sent, its own line's end at the latest. Never the end of the line up before
+        // it ("replaced"): that one ends the moment this reading takes its place — taken for this reading's
+        // end, sent readings looked lost and their wait was missed (FORK.md, the flaw now fixed).
+        let sent_seq = sent.iter().find(|x| s(x, "en") == s(r, "text") && t(x) >= t(r) && t(x) <= t(r) + 3000).and_then(|x| u(x, "seq"));
+        let end = match sent_seq {
+            Some(q) => ended_of.get(&q).copied(),
+            None => gone_ends.iter().copied().find(|&x| x > t(r)),
+        };
         let until = match (next.map(|n| t(n)), end) {
             (Some(a), Some(b)) => a.min(b),
             (Some(a), None) => a,
@@ -936,15 +974,20 @@ fn clear_after_advice(b: Blinks, gone: &[&&Line], end_tv: &[f64], end_pc: &[f64]
     // sooner (`span`: from the last pass the line was read in to the last one it wasn't). So the setting
     // works in steps of the passes' interval R: any value from k·R to (k+1)·R does the same — the Arabic
     // stays up over blinks of up to k passes, and goes k passes after its English.
+    // (1.5.0: the subtitles' English counts as gone after the dropout floor at the least — Clear after below
+    // it does what the floor does; 0 before 1.5.0)
+    let floor = timing.clear_floor_ms;
+    let eff = |a: f64| a.max(floor);
     let r = read_ms.max(1.0);
-    let step = |a: f64| (a / r).floor();
+    let step = |a: f64| (eff(a) / r).floor();
     let base_end = quant(ends, 0.5).unwrap_or(0.0);
     // candidates: every 10 ms from 30 to 500 and the value in use (what each would do, to compare), of which
-    // the middle of each step is the one advised (the furthest from the passes' jitter either way)
+    // the middle of each step is the one advised (the furthest from the passes' jitter either way) — at or
+    // over the floor: a value under it is the floor
     let middles: Vec<f64> = (0..50)
         .map(f64::from)
         .map(|k| (k, ((k + 0.5) * r / 10.0).round() * 10.0))
-        .filter(|&(k, a)| (30.0..=500.0).contains(&a) && step(a) == k)
+        .filter(|&(k, a)| (30.0..=500.0).contains(&a) && a >= floor && step(a) == k)
         .map(|(_, a)| a)
         .collect();
     let mut cands: Vec<(f64, bool)> = (3..=50).map(|k| f64::from(k) * 10.0).map(|a| (a, middles.contains(&a))).collect();
@@ -955,11 +998,11 @@ fn clear_after_advice(b: Blinks, gone: &[&&Line], end_tv: &[f64], end_pc: &[f64]
     let mut table = Vec::new();
     let mut best: Option<(f64, f64)> = None;
     for &(a, middle) in &cands {
-        let flickers = spans.iter().filter(|&&sp| sp > a).count() as f64;
+        let flickers = spans.iter().filter(|&&sp| sp > eff(a)).count() as f64;
         let shift = (step(a) - step(timing.clear_after_ms)) * r;
         let late: f64 = ends.iter().map(|e| (e + shift).max(0.0)).sum();
         let cost = flickers * o.flicker_ms + late;
-        table.push(json!({ "clear_after_ms": a, "passes": step(a), "flickers": flickers, "flickers_a_minute": r1(flickers / minutes.max(0.1)), "end_lag_p50_ms": r1(base_end + shift), "cost": r1(cost) }));
+        table.push(json!({ "clear_after_ms": a, "acts_as_ms": eff(a), "passes": step(a), "flickers": flickers, "flickers_a_minute": r1(flickers / minutes.max(0.1)), "end_lag_p50_ms": r1(base_end + shift), "cost": r1(cost) }));
         if middle && best.is_none_or(|b| cost < b.1) {
             best = Some((a, cost));
         }
@@ -967,12 +1010,17 @@ fn clear_after_advice(b: Blinks, gone: &[&&Line], end_tv: &[f64], end_pc: &[f64]
     let (mid, _) = best.unwrap_or((timing.clear_after_ms, 0.0));
     // the value in use, if it's in the best step already and clear of its edges: nothing to change
     let cur = timing.clear_after_ms;
-    let clear_of_edges = (cur - step(cur) * r).min((step(cur) + 1.0) * r - cur) >= 0.2 * r;
+    let clear_of_edges = (eff(cur) - step(cur) * r).min((step(cur) + 1.0) * r - eff(cur)) >= 0.2 * r;
     let v = if step(cur) == step(mid) && clear_of_edges { cur } else { mid };
     let row = |x: f64| table.iter().find(|r| r["clear_after_ms"].as_f64() == Some(x)).cloned().unwrap_or_default();
     let (now, rec) = (row(cur), row(v));
     let p95_miss = quant(ocr_miss, 0.95);
     let (lo, hi) = (step(v) * r, (step(v) + 1.0) * r);
+    let floor_said = if floor > 0.0 {
+        format!(" وفي هذا الإصدار لا تُعدّ إنجليزية الترجمة غائبة قبل {floor:.0} مللي ثانية: القيمة الحالية {cur:.0} تعمل كـ {:.0}، وكل قيمة أقل من {floor:.0} تعمل مثله.", eff(cur))
+    } else {
+        String::new()
+    };
     // the model's own check: the flickers it says for the value in use against those that happened
     let said_now = now["flickers"].as_f64().unwrap_or(0.0);
     let holds = (said_now - b.flickers_seen as f64).abs() <= 2.0_f64.max(0.3 * b.flickers_seen as f64);
@@ -983,7 +1031,7 @@ fn clear_after_advice(b: Blinks, gone: &[&&Line], end_tv: &[f64], end_pc: &[f64]
         Some(v),
         confidence,
         format!(
-            "القراءة تجري كل {r:.0} مللي ثانية، ولا يحكم التطبيق باختفاء النص إلا عند قراءة، فهذا الإعداد يعمل بخطوات من {r:.0}: كل القيم من {lo:.0} إلى أقل من {hi:.0} متكافئة، {}. خلال الجلسة غاب السطر الظاهر عن القراءة {} مرة دون أن يُقرأ مكانه شيء، منها {} والنص ما زال على الشاشة (خطأ قراءة){}. القيمة {v} أقل كلفة وفق المعيار: الوميض مقابل بقاء العربية بعد الإنجليزية (الوميض الواحد يُحسب بـ {:.1} ثانية من البقاء). {} هذه القيمة لمعدل الالتقاط الحالي: إن تغيّر Capture FPS تتغير الخطوة.",
+            "القراءة تجري كل {r:.0} مللي ثانية، ولا يحكم التطبيق باختفاء النص إلا عند قراءة، فهذا الإعداد يعمل بخطوات من {r:.0}: كل القيم من {lo:.0} إلى أقل من {hi:.0} متكافئة، {}.{floor_said} خلال الجلسة غاب السطر الظاهر عن القراءة {} مرة دون أن يُقرأ مكانه شيء، منها {} والنص ما زال على الشاشة (خطأ قراءة){}. القيمة {v} أقل كلفة وفق المعيار: الوميض مقابل بقاء العربية بعد الإنجليزية (الوميض الواحد يُحسب بـ {:.1} ثانية من البقاء). {} هذه القيمة لمعدل الالتقاط الحالي: إن تغيّر Capture FPS تتغير الخطوة.",
             if step(v) < 1.0 {
                 "تُخفي العربية عند أول قراءة لا يُرى فيها النص، فأي انقطاع قراءة يسبب وميضًا".to_string()
             } else {
@@ -1003,7 +1051,7 @@ fn clear_after_advice(b: Blinks, gone: &[&&Line], end_tv: &[f64], end_pc: &[f64]
             "الوميض: {} ← {} في الدقيقة. تأخر اختفاء العربية عن الإنجليزية (p50): {} ← {} مللي ثانية.",
             now["flickers_a_minute"], rec["flickers_a_minute"], now["end_lag_p50_ms"], rec["end_lag_p50_ms"]
         ),
-        json!({ "blinks": spans.len(), "blinks_text_still_there": ocr_miss.len(), "blinks_misread_only": b.misread_only, "flickers_seen": b.flickers_seen, "flickers_said_now": said_now, "model_holds": holds, "blink_p95_text_still_there_ms": p95_miss, "ends": ends.len(), "lines_shown": shown, "gone_lines": gone.len(), "pass_ms": r1(r), "table": table }),
+        json!({ "blinks": spans.len(), "blinks_text_still_there": ocr_miss.len(), "blinks_misread_only": b.misread_only, "flickers_seen": b.flickers_seen, "flickers_said_now": said_now, "model_holds": holds, "blink_p95_text_still_there_ms": p95_miss, "ends": ends.len(), "lines_shown": shown, "gone_lines": gone.len(), "pass_ms": r1(r), "floor_ms": floor, "table": table }),
         "جلسة لعب بالقيمة المقترحة، ثم أقارن الوميض وتأخر الاختفاء. والحكم الأخير لعينك على التلفزيون.".into(),
     )
 }
@@ -1032,6 +1080,8 @@ fn fmt_time(unix_ms: u64, o: &Options) -> String {
 /// lines of them all for review, and the advice from the longest segment played with the latest settings.
 pub fn analyze(events: &[Value], o: &Options) -> Value {
     let cpus = events.iter().rev().find(|e| kind(e) == "log" && e["cpus"].as_u64().is_some_and(|c| c > 0)).and_then(|e| f(e, "cpus"));
+    // (the app's version: 1.5.0's reading lets a subtitle be missed 250 ms before it counts as gone)
+    let app = events.iter().rev().find(|e| kind(e) == "log" && e["app"].is_string()).map(|e| s(e, "app").to_string()).unwrap_or_default();
     // the cuts: a settings change, or the log starting again
     let mut cuts: Vec<(usize, Option<&Value>)> = vec![(0, None)];
     let mut current: Option<&Value> = None;
@@ -1057,7 +1107,10 @@ pub fn analyze(events: &[Value], o: &Options) -> Value {
             continue;
         }
         let set = set.or_else(|| events[..=a.min(events.len() - 1)].iter().rev().find(|e| kind(e) == "settings"));
-        let mut r = analyze_segment(ev, timing_of(set), cpus, o);
+        let tm = timing_of(set, &app);
+        let mut r = analyze_segment(ev, tm, cpus, o);
+        r["source"] = json!(set.map(|e| s(e, "source")).unwrap_or(""));
+        r["settings"]["clear_floor_ms"] = json!(tm.clear_floor_ms);
         r["from"] = json!(fmt_time(t(&ev[0]), o));
         r["to"] = json!(fmt_time(t(&ev[ev.len() - 1]), o));
         segments.push(r);
@@ -1065,7 +1118,10 @@ pub fn analyze(events: &[Value], o: &Options) -> Value {
     // (no part long enough: the whole log as one, its advice saying where the data falls short)
     if segments.is_empty() && !events.is_empty() {
         let set = events.iter().rev().find(|e| kind(e) == "settings");
-        let mut r = analyze_segment(events, timing_of(set), cpus, o);
+        let tm = timing_of(set, &app);
+        let mut r = analyze_segment(events, tm, cpus, o);
+        r["source"] = json!(set.map(|e| s(e, "source")).unwrap_or(""));
+        r["settings"]["clear_floor_ms"] = json!(tm.clear_floor_ms);
         r["from"] = json!(fmt_time(t(&events[0]), o));
         r["to"] = json!(fmt_time(t(&events[events.len() - 1]), o));
         r["short"] = json!(true);
@@ -1158,6 +1214,24 @@ pub fn render_ar(r: &Value) -> String {
             seg["settings"]["stable_ms"],
             seg["settings"]["clear_after_ms"]
         ));
+        let source = match seg["source"].as_str().unwrap_or("") {
+            "xbox" => "مشغّل Xbox في التطبيق (البث يُفك ترميزه داخل التطبيق)",
+            "window" => "نافذة (تطبيق Xbox أو غيره: فك الترميز في تطبيقه هو)",
+            "ps5" => "مشغّل PS5 في التطبيق",
+            "obs" => "OBS",
+            "device" => "بطاقة التقاط",
+            "screen" => "شاشة",
+            _ => "",
+        };
+        if !source.is_empty() {
+            o.push_str(&format!("المصدر: {source}\n"));
+        }
+        if seg["settings"]["clear_floor_ms"].as_f64().is_some_and(|f| f > 0.0) {
+            o.push_str(&format!(
+                "(في هذا الإصدار لا تُعدّ إنجليزية الترجمة غائبة قبل {} مللي ثانية، فـ Clear after الأقل منها يعمل مثلها)\n",
+                seg["settings"]["clear_floor_ms"]
+            ));
+        }
         let sy = &seg["sync"];
         o.push_str(&format!(
             "- الأسطر المعروضة: {} ({} في الدقيقة)، من الذاكرة {}، من المترجم {}\n",
@@ -1203,6 +1277,13 @@ pub fn render_ar(r: &Value) -> String {
             "- الجهاز: المعالج للتطبيق p50 {}% وللجهاز {}%؛ الالتقاط {} إطار/ث من بث {}؛ الدورة p50 {} مللي ثانية؛ معالج خيط القراءة {} مللي ثانية/ث؛ كلفة السجل نفسه {} مللي ثانية/ث\n",
             v(&pc["cpu_app_pct"]["p50"]), v(&pc["cpu_all_pct"]["p50"]), v(&pc["capture_fps"]["p50"]), v(&pc["stream_fps"]["p50"]), v(&pc["pass_ms"]["p50"]), v(&pc["reader_cpu_ms_a_second"]), v(&pc["log_ms_a_second"])
         ));
+        if !pc["source_cpu_ms_a_second"].is_null() {
+            o.push_str(&format!(
+                "- فك ترميز البث في التطبيق (خيط المشغّل): {} مللي ثانية معالج في الثانية، وإطارات لم يُفك ترميزها {} (معالج التطبيق يشمله؛ والمقارنة العادلة بمصدر النافذة بمعالج الجهاز كله)\n",
+                v(&pc["source_cpu_ms_a_second"]),
+                v(&pc["bad_frames"])
+            ));
+        }
     }
     if let Some(recs) = r["advice"].as_array() {
         o.push_str(&format!(
@@ -1455,6 +1536,36 @@ mod tests {
     }
 
     #[test]
+    fn fork_advise_clear_after_knows_the_floor_of_1_5_0() {
+        // 1.5.0: a subtitle's English counts as gone after 250 ms at the least, whatever Clear after says.
+        // 1-pass blinks (100 ms) at Clear after 70: kept up over them (it acts as 250) — what happened
+        let mut ev = session(40, 4, 1, 70);
+        ev[0]["app"] = json!("1.5.0");
+        let r = analyze(&ev, &Options::default());
+        let ca = rec(&r, "clear_after_ms");
+        assert_eq!(ca["evidence"]["floor_ms"].as_f64(), Some(250.0), "{ca}");
+        assert_eq!((row(ca, "clear_after_ms", 70.0)["acts_as_ms"].as_f64(), row(ca, "clear_after_ms", 70.0)["flickers"].as_f64()), (Some(250.0), Some(0.0)), "{ca}");
+        assert_eq!(ca["evidence"]["model_holds"], true, "{ca}");
+        // every value under the floor does as the floor: 2 passes; 300 one more
+        let lag = |v: f64| row(ca, "clear_after_ms", v)["end_lag_p50_ms"].as_f64().unwrap();
+        assert_eq!((lag(50.0), lag(150.0)), (lag(70.0), lag(70.0)));
+        assert_eq!(lag(300.0) - lag(70.0), 100.0);
+        // nothing to change: the value in use already does the floor's step, clear of its edges
+        assert_eq!(ca["value"].as_f64(), Some(70.0), "{ca}");
+        assert!(ca["why"].as_str().unwrap().contains("250"), "{ca}");
+        // the log's own settings say the floor (1.5.0's settings event) whatever the version
+        let mut ev = session(40, 4, 1, 70);
+        for e in ev.iter_mut().filter(|e| kind(e) == "settings") {
+            e["clear_floor_ms"] = json!(300);
+        }
+        let r = analyze(&ev, &Options::default());
+        assert_eq!(rec(&r, "clear_after_ms")["evidence"]["floor_ms"].as_f64(), Some(300.0));
+        // a log of an older version: no floor
+        let r = analyze(&session(40, 4, 1, 70), &Options::default());
+        assert_eq!(rec(&r, "clear_after_ms")["evidence"]["floor_ms"].as_f64(), Some(0.0));
+    }
+
+    #[test]
     fn fork_advise_clear_after_works_in_steps_of_the_reading_passes() {
         // ten 1-frame blinks (a pass apart: 100 ms on a 10-a-second capture) in 40 lines, Clear after 70
         let r = analyze(&session(40, 4, 1, 70), &Options::default());
@@ -1507,5 +1618,32 @@ mod tests {
         assert_eq!(row(st, "stable_ms", 100.0)["passes_sure"].as_f64(), Some(1.0));
         assert_eq!(row(st, "stable_ms", 150.0)["passes_sure"].as_f64(), Some(2.0));
         assert_eq!((row(st, "stable_ms", 150.0)["premature"].as_u64(), row(st, "stable_ms", 150.0)["lost"].as_u64()), (Some(0), Some(6)), "{st}");
+    }
+
+    #[test]
+    fn fork_advise_stability_ends_a_reading_with_its_own_line_not_the_one_before() {
+        // (the flaw fixed in the move to 1.5.0, FORK.md) a new line the memory doesn't know taking the place
+        // of the line up, no gap between them: the line before ends ("replaced") the moment the new one is
+        // up — that is not the new reading's end. Each new line here was sent and stayed up 2 s.
+        let mut ev = session(30, 0, 0, 70);
+        let base = 1_800_000_000_000u64 + 200_000;
+        for i in 0..10u64 {
+            let t0 = base + i * 5000;
+            let new = format!("Strangers: Brand new line {i}.");
+            ev.push(json!({ "ev": "seen", "t": t0, "area": "subtitles", "text": format!("Jason: Line number {i} of the test."), "known": true, "sure": true }));
+            ev.push(json!({ "ev": "seen", "t": t0 + 1000, "area": "subtitles", "text": new, "known": false, "sure": true }));
+            ev.push(json!({ "ev": "sent", "t": t0 + 1100, "area": "subtitles", "seq": 300 + i, "en": new }));
+            ev.push(json!({ "ev": "ended", "t": t0 + 1150, "area": "subtitles", "seq": 200 + i, "how": "replaced" }));
+            ev.push(json!({ "ev": "ended", "t": t0 + 3100, "area": "subtitles", "seq": 300 + i, "how": "gone" }));
+        }
+        ev.sort_by_key(t);
+        let r = analyze(&ev, &Options::default());
+        let st = rec(&r, "stable_ms");
+        // (taken to end with the line before, at 150 ms, they'd all be lost from 150 on)
+        for v in [0.0, 150.0, 300.0, 400.0] {
+            assert_eq!(row(st, "stable_ms", v)["lost"].as_u64(), Some(0), "at {v}: {st}");
+        }
+        // and each one's wait is the passes it takes: 400 ms is 4 passes of 100, 3 later than 0's one
+        assert_eq!(row(st, "stable_ms", 400.0)["added_delay_ms"].as_f64(), Some(10.0 * 300.0), "{st}");
     }
 }

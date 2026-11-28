@@ -1,7 +1,8 @@
 # fork: the Xbox copy's checks on every push (see FORK.md): what it never changes in the original app
-# (.fork/guard.sh), the core's tests (the original's and the copy's), and the translation memory
-# answering exactly as the original's does (the same synthetic memory and download loaded by the
-# original's core and by this copy's: every answer compared).
+# (.fork/guard.sh), the core's tests (the original's and the copy's), the translation memory answering
+# exactly as the original's does (the same synthetic memory and download loaded by the original's core
+# and by this copy's: every answer compared), and the reading doing what the original's does (the same
+# made-up sessions through both cores, the copy's log off and on: everything that comes out compared).
 name: Fork guard
 
 on:
@@ -38,7 +39,10 @@ jobs:
       - name: The core's tests
         run: cargo test -p vi-translator-core
 
-      # (the tool builds from the same file in both: it uses only what the original's core has)
+      # (the tool builds from the same file in both: it uses only what the original's core has. The original's
+      # in a target folder of its own: two checkouts of the workspace in one folder can take each other's
+      # core for their own — the same package, the same paths in it — and the comparison would be of one
+      # core with itself)
       - name: The translation memory answers as the original's
         run: |
           set -euo pipefail
@@ -48,7 +52,7 @@ jobs:
           cp core/examples/fork_memory_equivalence.rs ../vit-base/core/examples/
           tool() { cargo run -q -p vi-translator-core --example fork_memory_equivalence -- "$@"; }
           tool sample "$RUNNER_TEMP/memeq"
-          (cd ../vit-base && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo run -q -p vi-translator-core --example fork_memory_equivalence -- \
+          (cd ../vit-base && CARGO_TARGET_DIR="$RUNNER_TEMP/target-original" cargo run -q -p vi-translator-core --example fork_memory_equivalence -- \
             dump --db "$RUNNER_TEMP/memeq/db" --pack-jsonl "$RUNNER_TEMP/memeq/pack.jsonl" --out "$RUNNER_TEMP/memeq/original.jsonl")
           tool dump --db "$RUNNER_TEMP/memeq/db" --pack-jsonl "$RUNNER_TEMP/memeq/pack.jsonl" --out "$RUNNER_TEMP/memeq/fork.jsonl"
           tool compare "$RUNNER_TEMP/memeq/original.jsonl" "$RUNNER_TEMP/memeq/fork.jsonl"
@@ -61,7 +65,7 @@ jobs:
           set -euo pipefail
           tool() { cargo run -q -p vi-translator-core --example fork_memory_equivalence -- "$@"; }
           tool sample-ties "$RUNNER_TEMP/ties"
-          (cd ../vit-base && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo run -q -p vi-translator-core --example fork_memory_equivalence -- \
+          (cd ../vit-base && CARGO_TARGET_DIR="$RUNNER_TEMP/target-original" cargo run -q -p vi-translator-core --example fork_memory_equivalence -- \
             dump --db "$RUNNER_TEMP/ties/db" --out "$RUNNER_TEMP/ties/original.jsonl")
           tool dump --db "$RUNNER_TEMP/ties/db" --out "$RUNNER_TEMP/ties/fork.jsonl"
           set +e
@@ -82,6 +86,25 @@ jobs:
       # core/tests/fork_advise_validation.rs)
       - name: The analyzer's model holds against the reader
         run: cargo test -q --release -p vi-translator-core --test fork_advise_validation -- --ignored --nocapture
+
+      # (the reading itself does what the original's does: the same made-up sessions through the original's
+      # core and through this copy's, its log off and on — every event for the window, every answer a TV
+      # gets, what's up at the end, the memory's answers and counts, the files the reading writes; the
+      # harness uses nothing of the copy's own; real time, about five minutes; see
+      # core/examples/fork_engine/harness.rs)
+      - name: The reading does what the original's does
+        run: |
+          set -euo pipefail
+          mkdir -p ../vit-base/core/examples/fork_engine
+          cp core/examples/fork_engine_equivalence.rs ../vit-base/core/examples/
+          cp core/examples/fork_engine/harness.rs ../vit-base/core/examples/fork_engine/
+          (cd ../vit-base && CARGO_TARGET_DIR="$RUNNER_TEMP/target-original" cargo run -q --release -p vi-translator-core --example fork_engine_equivalence -- \
+            play "$RUNNER_TEMP/engine-original.jsonl" --core original)
+          cargo run -q --release -p vi-translator-core --example fork_engine_equivalence -- play "$RUNNER_TEMP/engine-fork.jsonl" --core copy
+          cargo run -q --release -p vi-translator-core --example fork_engine_equivalence_log -- play "$RUNNER_TEMP/engine-fork-log.jsonl" --core copy
+          tool() { cargo run -q --release -p vi-translator-core --example fork_engine_equivalence -- "$@"; }
+          tool compare "$RUNNER_TEMP/engine-original.jsonl" "$RUNNER_TEMP/engine-fork.jsonl"
+          tool compare "$RUNNER_TEMP/engine-fork.jsonl" "$RUNNER_TEMP/engine-fork-log.jsonl" --ignore-log
 
       # (the measurement tools in the window of a release build — the original shows its Debugging section
       # in development builds only: the real window in Chromium, the app's commands answered by a stand-in,

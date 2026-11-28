@@ -5,7 +5,8 @@
 # - plain (a line added to README.md): merged, .fork/base-commit moved to it, the guard passing;
 # - conflict (the line right before a hook of this copy's changed): reported, nothing merged or pushed;
 # - workflows (a workflow file of the original's changed), without SYNC_TOKEN: reported, nothing pushed;
-# - settings (a timing default changed): merged, and flagged for the calibrated timing.
+# - settings (a timing default changed): merged, and flagged for the calibrated timing;
+# and every merge keeps .fork/base-version (the release version the build sets) a version.
 # Run from anywhere in the repository: bash .fork/tests/sync-dry-run.sh
 set -euo pipefail
 repo="$(git rev-parse --show-toplevel)"
@@ -33,12 +34,20 @@ original plain 'echo "A line the original added." >> README.md'
 original conflict 'python3 - <<PY
 p = "core/src/engine.rs"
 s = open(p).read()
-a = "        let (interval_ms, stable_ms, clear_after_ms) = c.timing();\n"
-assert s.count(a) == 1, "the line before the settings hook"
-open(p, "w").write(s.replace(a, a.replace("c.timing();", "c.timing(); // changed by the original")))
+a = "        ctx.memory.lock().unwrap().use_shared(c.shared_translations);\n"
+assert s.count(a) == 1, "the line before the settings hook (1.5.0)"
+open(p, "w").write(s.replace(a, a.replace("shared_translations);", "shared_translations); // changed by the original")))
 PY'
 original workflows 'echo "# changed by the original" >> .github/workflows/release.yml'
-original settings 'sed -i "s/clear_after_ms: 100 };/clear_after_ms: 120 };/" core/src/config.rs && grep -q "clear_after_ms: 120 };" core/src/config.rs'
+original settings 'python3 - <<PY
+import re
+p = "core/src/config.rs"
+s = open(p).read()
+# (the desktop default Clear after, whatever it is now: 100 in 1.4.4, 300 in 1.5.0)
+s, n = re.subn(r"(pub const DEFAULT_TIMING: DefaultTiming = DefaultTiming \{[^}]*clear_after_ms: )\d+", r"\g<1>123", s)
+assert n == 1, "the desktop default timing"
+open(p, "w").write(s)
+PY'
 
 failures=0
 # $1 the update, $2 the status expected, $3 settings flagged (yes/no)
@@ -62,6 +71,9 @@ expect() {
     [ "$pushed" = yes ] || ok=0
     [ "$(git -C "$work/origin.git" show "refs/heads/sync/$1:.fork/base-commit" | tr -d '[:space:]')" = "$(git -C "$work/up-$1" rev-parse HEAD)" ] || ok=0
     grep -q "^guard: " "$work/log-$1" || ok=0
+    # (and the original's release version for the build: the latest release tag in the new base's
+    # history, or the one before when there's none)
+    [[ "$(git -C "$work/origin.git" show "refs/heads/sync/$1:.fork/base-version" | tr -d '[:space:]')" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || ok=0
   else
     [ "$pushed" = no ] || ok=0
   fi

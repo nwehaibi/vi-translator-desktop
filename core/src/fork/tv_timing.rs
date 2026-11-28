@@ -40,18 +40,26 @@ pub fn for_tv<R>(token: &str, f: impl FnOnce() -> R) -> R {
 
 /// The state `version` was just written to the TV this thread answers (see `for_tv`): the lines up now
 /// were sent to it.
-pub fn sent_now(version: &str, live: &crate::live::Live) {
+/// `off` (1.5.0): this TV is switched off in the app (or, for this device's own viewer, its overlays are):
+/// it was sent the state with the overlays off, and draws nothing of it.
+pub fn sent_now(version: &str, live: &crate::live::Live, off: bool) {
     if !linelog::on() {
         return;
     }
     let Some(token) = TV.with(|t| t.borrow().clone()) else { return };
-    // the lines up: by area, each line's `at` (when its English appeared: the line's key in the log)
-    let shown: serde_json::Map<String, serde_json::Value> = live.shown.lock().unwrap().iter().map(|(a, ev)| (a.clone(), ev["at"].clone())).collect();
-    sent(&token, version, shown);
+    // the lines up: by area, each line's `at` (when its English appeared: the line's key in the log); none
+    // on a TV switched off
+    let shown: serde_json::Map<String, serde_json::Value> =
+        if off { serde_json::Map::new() } else { live.shown.lock().unwrap().iter().map(|(a, ev)| (a.clone(), ev["at"].clone())).collect() };
+    sent_as(&token, version, shown, off);
 }
 
 /// The state `version` (showing `shown`: area → line's `at`) was written to the TV with key `token`.
 pub fn sent(token: &str, version: &str, shown: serde_json::Map<String, serde_json::Value>) {
+    sent_as(token, version, shown, false);
+}
+
+fn sent_as(token: &str, version: &str, shown: serde_json::Map<String, serde_json::Value>, off: bool) {
     if !linelog::on() {
         return;
     }
@@ -65,7 +73,11 @@ pub fn sent(token: &str, version: &str, shown: serde_json::Map<String, serde_jso
             s.remove(0);
         }
     }
-    linelog::emit("tv_sent", json!({ "tv": tv, "version": version, "shown": shown }));
+    let mut e = json!({ "tv": tv, "version": version, "shown": shown });
+    if off {
+        e["off"] = json!(true);
+    }
+    linelog::emit("tv_sent", e);
 }
 
 /// The TV with key `token` drew state `version`, `draw_ms` after it arrived (the TV's own clock).
@@ -140,6 +152,11 @@ mod tests {
         assert!(get(server.port, &format!("/tv/drawn?t=fork-key-1&h={version}&draw=12")).starts_with("HTTP/1.1 200"));
         // another key gets nothing, and logs nothing
         assert!(get(server.port, "/tv/drawn?t=wrong&h=x&draw=1").starts_with("HTTP/1.1 403"));
+        // (1.5.0) the TV switched off in the app: sent the overlays off, it draws nothing — said so, no line on it
+        live.shown.lock().unwrap().insert("subtitles".into(), serde_json::json!({ "at": 1234 }));
+        live.tvs.set_on("tv-fork", false);
+        let off = get(server.port, &format!("/tv.json?t=fork-key-1&h={version}"));
+        let off_version = off.lines().find_map(|l| l.strip_prefix("X-State: ")).unwrap().trim().to_string();
         linelog::set_collector(None);
         server.stop();
         let events = collected.lock().unwrap().clone();
@@ -148,6 +165,8 @@ mod tests {
         let drawn = events.iter().find(|e| e["ev"] == "tv_drawn" && e["tv"] == tag.as_str()).expect("tv_drawn");
         assert_eq!(drawn["draw_ms"], 12);
         assert!(drawn["est"].as_u64().unwrap() >= drawn["sent"].as_u64().unwrap() + 12);
+        let sent_off = events.iter().find(|e| e["ev"] == "tv_sent" && e["version"] == off_version.as_str()).expect("the state sent switched off");
+        assert_eq!((sent_off["off"].as_bool(), sent_off["shown"].as_object().map(|m| m.len())), (Some(true), Some(0)), "{sent_off}");
         assert!(!events.iter().any(|e| e.to_string().contains("fork-key-1")), "the key never goes into the log");
         let _ = std::fs::remove_dir_all(dir);
     }

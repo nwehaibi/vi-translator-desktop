@@ -931,7 +931,11 @@ impl Reader {
         if crate::fork::linelog::on() {
             let custom = c.timing_custom == Some(true);
             let (capture_fps, preview_fps, picture_4k) = (c.capture_fps, c.preview_fps, c.picture_4k);
-            crate::fork::linelog::note_settings(crate::fork::linelog::Settings { capture_fps, preview_fps, picture_4k, interval_ms, stable_ms, clear_after_ms, custom });
+            // (as the reader applies Clear after: 1.5.0's dropout floor; and the source's kind, never its title)
+            let (clear_subtitles_ms, clear_other_ms) = (clear_ms_for(true, clear_after_ms), clear_ms_for(false, clear_after_ms));
+            let source = crate::fork::linelog::source_kind(&c.window_title);
+            let clear_floor_ms = DROPOUT_FLOOR_MS;
+            crate::fork::linelog::note_settings(crate::fork::linelog::Settings { capture_fps, preview_fps, picture_4k, interval_ms, stable_ms, clear_after_ms, custom, clear_subtitles_ms, clear_other_ms, clear_floor_ms, source });
         }
         if c.target_lang != last_lang {
             // another language: everything shown and cached is in the old one

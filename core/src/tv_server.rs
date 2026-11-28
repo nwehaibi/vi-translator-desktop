@@ -161,7 +161,7 @@ pub fn tv_state(cfg: &Mutex<Config>, live: &Live, mut s: TcpStream, token: &str,
             );
             let _ = s.set_nodelay(true);
             let _ = s.write_all(head.as_bytes()).and_then(|_| s.write_all(body.as_bytes()));
-            crate::fork::tv_timing::sent_now(&version, live); // fork: measurement log
+            crate::fork::tv_timing::sent_now(&version, live, off); // fork: measurement log (a TV switched off draws nothing)
             return;
         }
         if start.elapsed() >= Duration::from_secs(1) {

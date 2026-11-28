@@ -60,6 +60,21 @@ jobs:
           rustup default stable
           rustup target add "$TARGET"
 
+      # (the original's release workflow sets the version from its tag when it builds: its sources keep the
+      # one before — v1.5.0's say 1.4.4. This copy sets the original's release it is based on, as that build
+      # does, before it tests and builds: downloaded page scripts check it, the server is told it, the
+      # update banner compares it)
+      - name: The original's release version
+        run: |
+          set -euo pipefail
+          V="$(tr -d '[:space:]' < .fork/base-version)"
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::.fork/base-version must look like 1.2.3 (it says '$V')"; exit 1; }
+          export V
+          perl -0pi -e 's/^version = ".*?"/version = "$ENV{V}"/m' Cargo.toml
+          perl -0pi -e 's/"version": "[^"]*"/"version": "$ENV{V}"/' src-tauri/tauri.conf.json
+          grep -m1 '^version' Cargo.toml
+          grep -m1 '"version"' src-tauri/tauri.conf.json
+
       # (the app and its core: the workspace's default members, as the original's release tests them)
       # (a push always tests; by hand, as chosen)
       - name: Test
@@ -90,10 +105,12 @@ jobs:
           git worktree add --detach ../vit-base "$base"
           mkdir -p ../vit-base/core/examples
           cp core/examples/fork_memory_equivalence.rs ../vit-base/core/examples/
-          (cd ../vit-base && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --release --target "$TARGET" -p vi-translator-core --example fork_memory_equivalence)
-          cp "target/$TARGET/release/examples/fork_memory_equivalence.exe" out/tools/fork_memory_equivalence-original.exe
+          # (the original's in a target folder of its own: in one folder the two checkouts can take each
+          # other's core for their own)
+          (cd ../vit-base && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-original" cargo build --release --target "$TARGET" -p vi-translator-core --example fork_memory_equivalence)
+          cp "target-original/$TARGET/release/examples/fork_memory_equivalence.exe" out/tools/fork_memory_equivalence-original.exe
           cp .fork/memory-check.cmd .fork/sweep-plan.example.json out/tools/
-          printf 'original: %s\nfork: %s\n' "$base" "$(git rev-parse HEAD)" > out/tools/VERSIONS.txt
+          printf 'original: %s (release %s)\nfork: %s\n' "$base" "$(tr -d '[:space:]' < .fork/base-version)" "$(git rev-parse HEAD)" > out/tools/VERSIONS.txt
           ls -l out/tools
 
       # (a push's builds are kept two weeks, a build asked for by hand a month: the storage is limited)

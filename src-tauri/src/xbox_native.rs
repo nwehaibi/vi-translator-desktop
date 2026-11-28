@@ -362,6 +362,10 @@ const COLOR: YuvColor = YuvColor { bt709: true, full_range: false };
 
 impl xb::play::Screen for ToShared {
     fn frame(&self, f: xb::play::I420) {
+        // fork: measurement log: every frame the console's stream gave, decoded; and this thread's CPU (the
+        // decoder's: OpenH264, on the CPU, and the conversions below)
+        vi_translator_core::fork::linelog::note_arrived();
+        vi_translator_core::fork::linelog::note_source_cpu();
         let (full, preview) = {
             let t = self.times.lock().unwrap();
             (self.shared.full_due(t.0), self.shared.preview_due(t.1))
@@ -369,17 +373,22 @@ impl xb::play::Screen for ToShared {
         if !full && !preview {
             return;
         }
+        let fork_t0 = Instant::now(); // fork: measurement log (what taking a frame costs: its conversions)
         let f = ps::play::I420 { w: f.w, h: f.h, y: f.y, u: f.u, v: f.v, y_stride: f.y_stride, uv_stride: f.uv_stride };
         let yuy2 = ps::play::i420_to_yuy2(&f, false);
         let w = f.w & !1;
+        let fork_yuy2 = fork_t0.elapsed(); // fork: measurement log
         let mut t = self.times.lock().unwrap();
         if full {
             t.0 = Instant::now();
             self.shared.put_full(w, f.h, crate::capture::yuy2_to_rgba(&yuy2, w, f.h, COLOR));
+            vi_translator_core::fork::linelog::note_copy_cost(fork_t0.elapsed()); // fork: measurement log (I420 to YUY2 to RGBA)
         }
         if preview {
             t.1 = Instant::now();
             self.shared.put_preview_yuv(YuvFrame { w, h: f.h, color: COLOR, data: yuy2 });
+            // fork: measurement log (its YUY2, counted for the preview when no full frame was taken with it)
+            vi_translator_core::fork::linelog::note_preview_cost(t.1.elapsed() + if full { Duration::ZERO } else { fork_yuy2 });
         }
     }
 
@@ -449,6 +458,7 @@ pub fn start(shared: Arc<Shared>) -> XboxCapture {
         while !s2.load(Ordering::Relaxed) && !g().restart.load(Ordering::Relaxed) {
             let st = player.status();
             let pads = player.stats.controllers.load(Ordering::Relaxed);
+            vi_translator_core::fork::linelog::note_source_bad_frames(player.stats.bad_frames.load(Ordering::Relaxed)); // fork: measurement log
             if last.as_ref() != Some(&st) || last_line.elapsed() > Duration::from_secs(1) {
                 set(status_line(&st, &c.name, pads));
                 last_line = Instant::now();

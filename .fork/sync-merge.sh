@@ -32,6 +32,21 @@ if git diff "$before" HEAD -- core/src/config.rs | grep -qE '^[+-].*(DEFAULTS_VE
 fi
 printf '%s\n' "$up" > .fork/base-commit
 git add .fork/base-commit
+# (and the original's latest release in the new base's history: its sources keep the version before a
+# release — its release workflow sets it from the tag — so this copy's build sets it from
+# .fork/base-version; no release tag found: the version stays)
+tags="$(git ls-remote --tags "$UPSTREAM" 'v*' 2>/dev/null || true)"
+version="$(printf '%s\n' "$tags" | while read -r sha ref; do
+  tag="${ref#refs/tags/}"
+  tag="${tag%"^{}"}"
+  [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+  if git merge-base --is-ancestor "$sha" "$up" 2>/dev/null; then echo "${tag#v}"; fi
+done | sort -V | tail -1)"
+if [ -n "$version" ]; then
+  printf '%s\n' "$version" > .fork/base-version
+  git add .fork/base-version
+  echo "version=${version}" >> "$GITHUB_OUTPUT"
+fi
 git commit -m "fork: based on the original's ${up:0:7}"
 if ! bash .fork/guard.sh; then
   echo "status=guard" >> "$GITHUB_OUTPUT"

@@ -89,6 +89,7 @@ fn refresh(s: &Sinks) {
     *SETTINGS.lock().unwrap() = None;
     *READS.lock().unwrap() = None;
     super::timeline::reset();
+    SOURCE_BAD_LAST.store(u64::MAX, Ordering::Relaxed);
 }
 
 /// Write the log in the folder `dir` (None: stop writing it): a new session's file, going on in further
@@ -303,6 +304,42 @@ pub fn note_copy_cost(d: Duration) {
     }
 }
 
+/// (1.5.0) Called on the source's own thread at each of its frames (the app's Xbox player: on its decoder's
+/// thread): that thread's CPU, sampled four times a second at most, goes into the second's readings.
+pub fn note_source_cpu() {
+    if !on() {
+        return;
+    }
+    thread_local! {
+        static LAST: std::cell::Cell<Option<(Instant, f64)>> = const { std::cell::Cell::new(None) };
+    }
+    LAST.with(|last| {
+        let now = Instant::now();
+        if last.get().is_some_and(|(t, _)| now.duration_since(t) < Duration::from_millis(250)) {
+            return;
+        }
+        if let Some(ms) = super::cpu::thread_ms() {
+            if let Some((_, before)) = last.get() {
+                SOURCE_CPU_US.fetch_add(((ms - before).max(0.0) * 1000.0) as u64, Ordering::Relaxed);
+            }
+            last.set(Some((now, ms)));
+        }
+    });
+}
+
+/// (1.5.0) The source's frames it couldn't decode so far (a running count: the app's Xbox player's). The
+/// first count told after the log starts is where it counts from; a count lower than the last (a new
+/// stream) starts again from there.
+pub fn note_source_bad_frames(total: u64) {
+    if !on() {
+        return;
+    }
+    let prev = SOURCE_BAD_LAST.swap(total, Ordering::Relaxed);
+    if prev != u64::MAX && total > prev {
+        SOURCE_BAD_NEW.fetch_add(total - prev, Ordering::Relaxed);
+    }
+}
+
 /// Making a preview frame (shrinking it, or encoding it as JPEG) took `d`.
 pub fn note_preview_cost(d: Duration) {
     if on() {
@@ -322,6 +359,29 @@ pub struct Settings {
     pub clear_after_ms: u64,
     /// the player's own timing (else the game's, from its layout)
     pub custom: bool,
+    /// (1.5.0) when the English counts as gone as the reader applies it: the subtitles (lines that stack
+    /// up: Clear after, 250 ms at the least) and the other areas (350 at the least)
+    pub clear_subtitles_ms: u64,
+    pub clear_other_ms: u64,
+    /// (1.5.0) the subtitles' dropout floor itself (250 ms): a Clear after below it does what it does
+    pub clear_floor_ms: u64,
+    /// the picture's source, its kind only (`source_kind`): never a window's title
+    pub source: &'static str,
+}
+
+/// The kind of a source as Source names it (`Config::window_title`): the app's own Xbox player
+/// ("xbox:", 1.5.0), the PS5's, OBS, a capture card ("device:"), a screen ("screen:"), else a window (the
+/// Xbox app's, Microsoft's web player, …) — its title never goes into the log.
+pub fn source_kind(source: &str) -> &'static str {
+    match source.split_once(':').map(|(k, _)| k) {
+        _ if source.is_empty() => "none",
+        Some("xbox") => "xbox",
+        Some("ps5") => "ps5",
+        Some("obs") => "obs",
+        Some("device") => "device",
+        Some("screen") => "screen",
+        _ => "window",
+    }
 }
 
 static SETTINGS: Mutex<Option<Settings>> = Mutex::new(None);
@@ -342,6 +402,7 @@ pub fn note_settings(s: Settings) {
         json!({
             "capture_fps": s.capture_fps, "preview_fps": s.preview_fps, "picture_4k": s.picture_4k, "interval_ms": s.interval_ms,
             "stable_ms": s.stable_ms, "clear_after_ms": s.clear_after_ms, "timing_custom": s.custom,
+            "clear_subtitles_ms": s.clear_subtitles_ms, "clear_other_ms": s.clear_other_ms, "clear_floor_ms": s.clear_floor_ms, "source": s.source,
         }),
     );
 }
@@ -379,6 +440,13 @@ static ARRIVED_NOW: AtomicU32 = AtomicU32::new(0);
 static COPY_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static COPY_N: AtomicU32 = AtomicU32::new(0);
 static PREVIEW_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// (1.5.0) the source's own thread — the app's Xbox player decoding the stream (OpenH264, on the CPU) —
+/// its CPU time (µs), and the frames it couldn't decode (its running count, as last told)
+static SOURCE_CPU_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// (the running count as last told — `u64::MAX`: none yet since the log started —, and the frames it
+/// grew by since the last second's readings)
+static SOURCE_BAD_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+static SOURCE_BAD_NEW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FRAME_W: AtomicU32 = AtomicU32::new(0);
 static FRAME_H: AtomicU32 = AtomicU32::new(0);
 
@@ -428,6 +496,8 @@ fn with_reads(f: impl FnOnce(&mut Reads)) {
             COPY_US.store(0, Ordering::Relaxed);
             COPY_N.store(0, Ordering::Relaxed);
             PREVIEW_US.store(0, Ordering::Relaxed);
+            SOURCE_CPU_US.store(0, Ordering::Relaxed);
+            SOURCE_BAD_NEW.store(0, Ordering::Relaxed);
             SELF_TIME.with(|s| s.set(Duration::ZERO));
             now
         });
@@ -455,6 +525,8 @@ fn with_reads(f: impl FnOnce(&mut Reads)) {
         let avg = |(n, t): (u32, f64)| (n > 0).then(|| round1(t / f64::from(n)));
         let thread_cpu = super::cpu::thread_ms();
         let log_ms = SELF_TIME.with(|s| s.replace(Duration::ZERO)).as_secs_f64() * 1000.0;
+        // (1.5.0) a source with a thread of its own (the app's Xbox player) told its CPU this second
+        let source_cpu = SOURCE_CPU_US.load(Ordering::Relaxed) > 0;
         let ev = json!({
             "n": r.n, "ocr_avg": round1(r.total / f64::from(r.n.max(1))), "ocr_max": round1(r.max),
             "pass_n": r.passes, "pass_avg": round1(r.pass_total / f64::from(r.passes.max(1))), "pass_max": round1(r.pass_max),
@@ -467,6 +539,10 @@ fn with_reads(f: impl FnOnce(&mut Reads)) {
             "stream_fps": round1(f64::from(ARRIVED_NOW.swap(0, Ordering::Relaxed)) / secs),
             "copy_ms": (copy_n > 0).then(|| round1(copy_us as f64 / 1000.0 / f64::from(copy_n))),
             "preview_ms": (previews > 0 && preview_us > 0).then(|| round1(preview_us as f64 / 1000.0 / f64::from(previews))),
+            // (1.5.0) the source's own thread (the app's Xbox player decoding the stream): its CPU this second
+            // (ms), and the frames it couldn't decode this second
+            "source_cpu_ms": source_cpu.then_some(round1(SOURCE_CPU_US.swap(0, Ordering::Relaxed) as f64 / 1000.0)),
+            "bad_frames": source_cpu.then_some(SOURCE_BAD_NEW.swap(0, Ordering::Relaxed)),
             // (v2) a pass's frame: its age when the pass began, the wait since the pass before, passes on an old frame
             "age_ms": avg(r.age), "idle_ms": avg(r.idle), "same_frame": r.same_frame,
             "done_ms": r.done.iter().map(|(a, v)| (a.clone(), json!(avg(*v)))).collect::<serde_json::Map<String, Value>>(),
@@ -699,7 +775,7 @@ mod tests {
 
     #[test]
     fn fork_linelog_tells_the_settings_once_and_again_when_they_change() {
-        let base = Settings { capture_fps: 12, preview_fps: 60, picture_4k: true, interval_ms: 16, stable_ms: 0, clear_after_ms: 70, custom: false };
+        let base = Settings { capture_fps: 12, preview_fps: 60, picture_4k: true, interval_ms: 16, stable_ms: 0, clear_after_ms: 70, custom: false, clear_subtitles_ms: 250, clear_other_ms: 350, clear_floor_ms: 250, source: "xbox" };
         let (_, v) = collect(|| {
             note_settings(base);
             note_settings(base);
@@ -709,9 +785,47 @@ mod tests {
         assert_eq!(s.len(), 2, "{v:?}");
         assert_eq!((s[0]["picture_4k"].as_bool(), s[0]["clear_after_ms"].as_u64()), (Some(true), Some(70)));
         assert_eq!((s[1]["interval_ms"].as_u64(), s[1]["timing_custom"].as_bool()), (Some(100), Some(true)));
+        // (1.5.0) as the reader applies Clear after, and the source's kind
+        assert_eq!((s[0]["clear_subtitles_ms"].as_u64(), s[0]["clear_other_ms"].as_u64(), s[0]["source"].as_str()), (Some(250), Some(350), Some("xbox")));
         // a log started again says them again
         let (_, v) = collect(|| note_settings(base));
         assert_eq!(v.iter().filter(|e| e["ev"] == "settings").count(), 1);
+    }
+
+    #[test]
+    fn fork_linelog_names_a_source_by_its_kind_only() {
+        assert_eq!(source_kind("xbox:"), "xbox");
+        assert_eq!(source_kind("ps5:"), "ps5");
+        assert_eq!(source_kind("obs:Game capture"), "obs");
+        assert_eq!(source_kind("device:USB Video"), "device");
+        assert_eq!(source_kind("screen:1"), "screen");
+        // (a window: its title, whatever it says, stays out)
+        assert_eq!(source_kind("Xbox"), "window");
+        assert_eq!(source_kind("My: private window"), "window");
+        assert_eq!(source_kind(""), "none");
+    }
+
+    #[test]
+    fn fork_linelog_tells_the_sources_own_thread() {
+        let (_, v) = collect(|| {
+            read_sample("subtitles", 30.0);
+            note_source_bad_frames(3);
+            // (the source's thread: busy a while between two of its frames)
+            note_source_cpu();
+            let t = Instant::now();
+            let mut x = 0u64;
+            while t.elapsed() < Duration::from_millis(300) {
+                x = x.wrapping_mul(31).wrapping_add(7);
+            }
+            std::hint::black_box(x);
+            note_source_cpu();
+            note_source_bad_frames(5);
+            std::thread::sleep(Duration::from_millis(750));
+            read_sample("subtitles", 30.0);
+        });
+        let r = v.iter().find(|e| e["ev"] == "reads").expect("a second's readings");
+        assert!(r["source_cpu_ms"].as_f64().is_some_and(|ms| ms > 100.0), "{r}");
+        assert_eq!(r["bad_frames"].as_u64(), Some(2), "{r}");
     }
 
     #[test]
